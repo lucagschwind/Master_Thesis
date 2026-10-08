@@ -1,0 +1,149 @@
+---
+title: "SHAP dependence plots for the aligned Big Five scores"
+output: html_document
+---
+
+# SHAP dependence plots for the aligned Big Five scores
+
+This script gives the following figure: Supplementary Figure S4, SHAP Dependence Plots for the Aligned Big Five Scores in the Random Forest. It reads the SHAP values and the hold-out predictor values with standardised aligned scores saved by the random forest script.
+
+```{r}
+library(ggplot2)
+library(shapviz)
+library(patchwork)
+
+# The saved SHAP values and the hold-out predictor values with standardised aligned scores are loaded.
+rf_trait_shap_values <- readRDS("rf_trait_shap_values.rds")
+rf_trait_shap_data_standardised <- readRDS("rf_trait_shap_data_standardised.rds")
+```
+
+## Panels and sizes
+
+```{r}
+# These are the five panels. Their order is the order of the panels, and the names are the panel titles.
+trait_panel_labels <- c(
+  CON = "Conscientiousness",
+  AGR = "Agreeableness",
+  OPE = "Openness",
+  EXT = "Extraversion",
+  NEU = "Neuroticism"
+)
+
+# This factor scales the size of all points and the thickness of all lines in the panels.
+rf_trait_mark <- 7.5 / 12
+```
+
+## Drawing the original dependence plot
+
+```{r}
+# shapviz draws the original dependence plot: one panel for each aligned score.
+# Each grey, semi-transparent point is one hold-out participant, with its SHAP value on the y-axis.
+# The x-axis uses the hold-out scores standardised with the training-set mean and standard deviation.
+# The points are not coloured by another predictor.
+rf_trait_dependence <- sv_dependence(
+  shapviz(rf_trait_shap_values, X = rf_trait_shap_data_standardised),
+  v = names(trait_panel_labels),
+  color_var = NULL,
+  color = "grey70",
+  share_y = FALSE,
+  alpha = 0.45,
+  size = 0.6 * rf_trait_mark
+)
+```
+
+## Adjusting the plot
+
+```{r}
+# The original plot is then adjusted.
+rf_trait_dependence <- rf_trait_dependence &
+  # A black horizontal line is drawn at a SHAP value of zero.
+  geom_hline(yintercept = 0, colour = "black", linewidth = 0.6 * rf_trait_mark) &
+  # The x-axis is divided into ten intervals. In each interval, a vertical bar spans the mean SHAP value plus and minus one standard deviation.
+  stat_summary_bin(
+    fun = mean,
+    fun.min = function(y) mean(y) - sd(y),
+    fun.max = function(y) mean(y) + sd(y),
+    geom = "errorbar",
+    bins = 10,
+    width = 0.25,
+    linewidth = 0.5 * rf_trait_mark
+  ) &
+  # A black line connects the mean SHAP values of the ten intervals.
+  stat_summary_bin(aes(group = 1), fun = mean, geom = "line", bins = 10, linewidth = 0.5 * rf_trait_mark) &
+  # A black point marks the mean SHAP value of each interval.
+  stat_summary_bin(fun = mean, geom = "point", bins = 10, size = 1.5 * rf_trait_mark) &
+  # All panels use the same axes: standardised scores from -4.45 to 4.45 on the x-axis and SHAP values from -0.6 to 0.6 on the y-axis.
+  # The x-axis title is removed from the panels, because one title is placed below the whole figure.
+  # The panels have a white background, dashed horizontal grid lines, black axis text, and centred titles.
+  scale_x_continuous(breaks = seq(-4, 4, by = 2), expand = expansion(add = 0)) &
+  scale_y_continuous(breaks = seq(-0.5, 0.5, by = 0.25), limits = c(-0.6, 0.6)) &
+  coord_cartesian(xlim = c(-4.45, 4.45)) &
+  labs(x = NULL) &
+  theme_bw(base_size = 11, base_family = "Arial") &
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80", linetype = "dashed"),
+    axis.ticks = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks.length = unit(0.15, "cm"),
+    axis.text = element_text(colour = "black"),
+    axis.title = element_text(colour = "black", face = "plain", size = 11),
+    plot.title = element_text(colour = "black", face = "plain", size = 11, hjust = 0.5),
+    plot.margin = margin(5, 8, 2, 4)
+  )
+
+# Each panel receives the name of its trait as its title.
+dependence_panels <- lapply(seq_along(trait_panel_labels), function(i) {
+  rf_trait_dependence[[i]] + labs(title = trait_panel_labels[[i]])
+})
+
+# This theme removes the y-axis numbers, ticks, and title. It is applied to neuroticism, so the lower row shows the y-axis only beside extraversion.
+hide_y <- theme(
+  axis.text.y = element_blank(),
+  axis.title.y = element_blank(),
+  axis.ticks.y = element_blank()
+)
+
+# The upper row contains conscientiousness, agreeableness, and openness. The y-axis is shown once, on the left of this row.
+top_row <- dependence_panels[[1]] + dependence_panels[[2]] + dependence_panels[[3]] +
+  plot_layout(nrow = 1, widths = c(1, 1, 1), axes = "collect")
+
+# The lower row contains extraversion and neuroticism, centred between two empty spaces.
+# The widths give these panels the same width as the panels above.
+bottom_row <- plot_spacer() +
+  dependence_panels[[4]] +
+  (dependence_panels[[5]] + hide_y) +
+  plot_spacer() +
+  plot_layout(nrow = 1, widths = c(0.326, 1, 1, 0.326), axes = "collect")
+
+# The x-axis title is created as a separate text element.
+x_title <- wrap_elements(
+  full = grid::textGrob(
+    "Standardised aligned Big Five score",
+    gp = grid::gpar(fontsize = 11, fontfamily = "Arial", col = "black")
+  )
+)
+
+# The upper row, the lower row, and the x-axis title are stacked. The title occupies a narrow strip at the bottom.
+rf_trait_dependence <- top_row / bottom_row / x_title +
+  plot_layout(heights = c(1, 1, 0.045))
+
+# The figure is shown in the R output.
+rf_trait_dependence
+```
+
+## Saving the figure
+
+```{r}
+# The figure is saved as the PDF for Supplementary Figure S4.
+dir.create("figures", showWarnings = FALSE)
+
+ggsave(
+  "figures/figure_shap_trait_dependence_rf.pdf",
+  plot = rf_trait_dependence,
+  width = 19.05,
+  height = 13.72,
+  units = "cm",
+  device = cairo_pdf
+)
+```

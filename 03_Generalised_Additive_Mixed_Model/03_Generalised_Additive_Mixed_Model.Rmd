@@ -1,0 +1,320 @@
+---
+title: "Generalised additive mixed model"
+output: html_document
+---
+ 
+# Generalised additive mixed model
+
+This script gives the following results for the generalised additive mixed model, separately for the aligned Big Five scores and the BFI-S items: the cross-validated performance, the training-set and hold-out performance, and the smooth-term summaries. The training-set models are saved for the smooth-figure scripts. The printed tables are saved so those results can be read again without refitting.
+
+## Modelling sample
+
+The cleaning below is the same code as in Han and gives the same modelling sample as in the other analysis scripts.
+
+```{r}
+# The packages for the data, the model, and the performance measures are loaded.
+library(tidyverse)
+library(mgcv)
+library(rsample)
+library(yardstick)
+
+# The aligned data are loaded.
+load("covid_aligned_BFF.RData")
+
+# Country, gender, and education are stored as factors.
+data_NEU.aligned$Country<-as.factor(data_NEU.aligned$Country)
+data_NEU.aligned$Dem_gender<-as.factor(data_NEU.aligned$Dem_gender)
+data_NEU.aligned$Dem_edu<-as.factor(data_NEU.aligned$Dem_edu)
+
+# Rows with missing age, gender, or education are removed.
+data<-data_NEU.aligned[
+  !is.na(data_NEU.aligned$Dem_age)&
+  !is.na(data_NEU.aligned$Dem_edu)&
+  !is.na(data_NEU.aligned$Dem_gender),]
+
+# Country is recoded to numbers and stored as a factor. The models use this version.
+data$country<-as.numeric(data$Country)
+data$country<-as.factor(data$country)
+```
+
+## Training set
+
+The split below is the same participant-level split as in the other analyses. Cross-validation is done inside the training set. The hold-out set is used only for the final performance (Methods section).
+
+```{r}
+set.seed(17)
+
+# The participants are divided into a training set with 80% and a hold-out set with 20%.
+data_split <- group_initial_split(data, group = ID, prop = 0.8)
+train_set <- training(data_split)
+holdout_set <- testing(data_split)
+
+# The training set is divided into five folds for cross-validation.
+cv_folds <- group_vfold_cv(train_set, group = ID, v = 5)
+
+# The sample sizes of the training set and the hold-out set are printed.
+nrow(train_set)
+nrow(holdout_set)
+```
+
+## Models
+
+Both models contain a smooth for each personality predictor and for age. Gender and education are categorical predictors, and country is a random intercept. The two models differ only in the personality predictors. The basis dimension is \(k = 10\) for the aligned scores and \(k = 5\) for the items, and age uses the same basis dimension (Methods section).
+
+```{r}
+# The personality predictors of the two models are the five aligned scores and the 15 items.
+trait_predictors <- c("NEU", "EXT", "OPE", "AGR", "CON")
+item_predictors <- paste0("BFF_15_", 1:15)
+
+# The aligned-score model has a random intercept for country and smooths with k = 10 for the five scores and age.
+# Gender and education are categorical predictors. Columns ending in _z are standardised.
+trait_formula <- Compliance_2 ~ s(country, bs = "re") +
+  s(NEU_z, bs = "tp", k = 10) + s(EXT_z, bs = "tp", k = 10) +
+  s(OPE_z, bs = "tp", k = 10) + s(AGR_z, bs = "tp", k = 10) +
+  s(CON_z, bs = "tp", k = 10) + s(Dem_age_z, bs = "tp", k = 10) +
+  Dem_gender + Dem_edu
+
+# The item model has the same structure, with smooths with k = 5 for the 15 items and age.
+item_formula <- Compliance_2 ~ s(country, bs = "re") +
+  s(BFF_15_1_z, bs = "tp", k = 5) + s(BFF_15_2_z, bs = "tp", k = 5) +
+  s(BFF_15_3_z, bs = "tp", k = 5) + s(BFF_15_4_z, bs = "tp", k = 5) +
+  s(BFF_15_5_z, bs = "tp", k = 5) + s(BFF_15_6_z, bs = "tp", k = 5) +
+  s(BFF_15_7_z, bs = "tp", k = 5) + s(BFF_15_8_z, bs = "tp", k = 5) +
+  s(BFF_15_9_z, bs = "tp", k = 5) + s(BFF_15_10_z, bs = "tp", k = 5) +
+  s(BFF_15_11_z, bs = "tp", k = 5) + s(BFF_15_12_z, bs = "tp", k = 5) +
+  s(BFF_15_13_z, bs = "tp", k = 5) + s(BFF_15_14_z, bs = "tp", k = 5) +
+  s(BFF_15_15_z, bs = "tp", k = 5) + s(Dem_age_z, bs = "tp", k = 5) +
+  Dem_gender + Dem_edu
+
+# This function fits a GAMM by REML. Each smooth can be shrunk to zero if it does not improve the fit.
+fit_gamm <- function(formula, data) {
+  gam(formula, family = gaussian(), method = "REML", select = TRUE, data = data)
+}
+```
+
+## Performance
+
+The same three functions are used for both predictor representations. `evaluate()` fits one model and calculates its performance. `cross_validate()` repeats this in the five training-set folds. `final_performance()` fits the model once to the complete training set and scores it on the hold-out set. The smooth summaries use this training-set fit. \(R^2\) is calculated with `rsq_trad`. In the printed tables, Assessment is the left-out fold during cross-validation and the hold-out set in the final performance.
+
+```{r}
+# RMSE, MAE, and R2 are the performance measures. rmse and mae are taken from yardstick.
+performance_metrics <- metric_set(yardstick::rmse, yardstick::mae, rsq_trad)
+
+# This function standardises the given predictors with the mean and standard deviation of the reference data.
+# The standardised values are stored in new columns ending in _z.
+standardise <- function(data, reference_data, predictors) {
+  centre <- map_dbl(reference_data[predictors], mean)
+  spread <- map_dbl(reference_data[predictors], sd)
+  data[paste0(predictors, "_z")] <- scale(data[predictors], center = centre, scale = spread)
+  data
+}
+
+# This function fits one model and calculates its performance in the fitting data and in new data.
+# The new data are the left-out fold during cross-validation and the hold-out set in the final performance.
+evaluate <- function(formula, predictors, fit_data, new_data) {
+  # Age and the personality predictors are standardised in both data sets with the mean and standard deviation of the fitting data.
+  numeric_predictors <- c(predictors, "Dem_age")
+  fit_data <- standardise(fit_data, fit_data, numeric_predictors)
+  new_data <- standardise(new_data, fit_data, numeric_predictors)
+
+  # The GAMM is fitted, and general compliance is predicted in both data sets.
+  model <- fit_gamm(formula, fit_data)
+  fit_data$.pred <- predict(model, newdata = fit_data)
+  new_data$.pred <- predict(model, newdata = new_data)
+
+  # RMSE, MAE, and R2 are calculated in both data sets, labelled Training and Assessment.
+  metrics <- bind_rows(
+    Training = performance_metrics(fit_data, Compliance_2, .pred),
+    Assessment = performance_metrics(new_data, Compliance_2, .pred),
+    .id = "set"
+  )
+
+  # The performance and the fitted model are returned.
+  list(metrics = metrics, model = model)
+}
+
+# This function runs the five-fold cross-validation and summarises the performance.
+cross_validate <- function(formula, predictors) {
+  # In each fold, the model is fitted to the other four folds and scored on the left-out fold. Only the performance is kept.
+  folds <- map_dfr(
+    cv_folds$splits,
+    function(split) {
+      evaluate(formula, predictors, analysis(split), assessment(split))$metrics
+    },
+    .id = "fold"
+  )
+
+  # The mean and standard deviation across the five folds are calculated and rounded to three decimals.
+  cv_summary <- folds %>%
+    group_by(set, .metric) %>%
+    summarise(mean = round(mean(.estimate), 3), sd = round(sd(.estimate), 3), .groups = "drop")
+
+  # In each fold, the validation R2 is subtracted from the training R2.
+  # The mean and standard deviation of this difference are then calculated.
+  delta_r2 <- folds %>%
+    filter(.metric == "rsq_trad") %>%
+    pivot_wider(id_cols = fold, names_from = set, values_from = .estimate) %>%
+    summarise(mean = round(mean(Training - Assessment), 3), sd = round(sd(Training - Assessment), 3))
+
+  # The performance summary and the R2 difference are returned.
+  list(summary = cv_summary, delta_r2 = delta_r2)
+}
+
+# This function fits the model once to the complete training set and scores it on the hold-out set.
+final_performance <- function(formula, predictors) {
+  fitted <- evaluate(formula, predictors, train_set, holdout_set)
+  results <- fitted$metrics
+
+  # The unrounded training R2 and hold-out R2 are extracted.
+  training_r2 <- results %>%
+    filter(set == "Training", .metric == "rsq_trad") %>%
+    pull(.estimate)
+  holdout_r2 <- results %>%
+    filter(set == "Assessment", .metric == "rsq_trad") %>%
+    pull(.estimate)
+
+  # The rounded performance, the R2 difference, and the training-set model are returned.
+  # The R2 difference is calculated from the unrounded values and then rounded.
+  list(
+    metrics = mutate(results, .estimate = round(.estimate, 3)),
+    delta_r2 = round(training_r2 - holdout_r2, 3),
+    model = fitted$model
+  )
+}
+```
+
+### Aligned Big Five scores
+
+The code below first calculates the cross-validated performance and then the training-set and hold-out performance for the aligned Big Five scores (Supplementary Table S4, then Table 1 and Supplementary Table S3).
+
+```{r}
+# The cross-validated performance is calculated and printed (Supplementary Table S4).
+trait_cv <- cross_validate(trait_formula, trait_predictors)
+trait_cv
+
+# The training-set and hold-out performance and the R2 difference are calculated and printed (Table 1; Supplementary Table S3).
+# The training-set model is saved for Figure 6.
+trait_final <- final_performance(trait_formula, trait_predictors)
+trait_final$metrics
+trait_final$delta_r2
+saveRDS(trait_final$model, "gamm_trait_model.rds")
+```
+
+### BFI-S items
+
+The code below first calculates the cross-validated performance and then the training-set and hold-out performance for the BFI-S items (Supplementary Table S4, then Table 1 and Supplementary Table S3).
+
+```{r}
+# The cross-validated performance is calculated and printed (Supplementary Table S4).
+item_cv <- cross_validate(item_formula, item_predictors)
+item_cv
+
+# The training-set and hold-out performance and the R2 difference are calculated and printed (Table 1; Supplementary Table S3).
+# The training-set model is saved for Supplementary Figure S2.
+item_final <- final_performance(item_formula, item_predictors)
+item_final$metrics
+item_final$delta_r2
+saveRDS(item_final$model, "gamm_item_model.rds")
+```
+
+## Smooth terms
+
+The summaries below use the training-set models already fitted for the hold-out performance. EDF describes the curvature of a smooth: values near 1 are approximately linear. \(\Delta\mathrm{AIC}\) is the AIC of the model with that predictor entered as a straight line minus the AIC of the model with that predictor entered as a smooth. Positive values favour the smooth (Supplementary Tables S6 and S7).
+
+```{r}
+# This function builds the comparison formula.
+# One personality predictor is entered as a straight line, and all other terms stay as in the full model.
+linear_formula <- function(predictors, linear_predictor, k) {
+  # The selected predictor is linear, and the other personality predictors remain smooths.
+  personality_terms <- if_else(
+    predictors == linear_predictor,
+    paste0(predictors, "_z"),
+    paste0("s(", predictors, "_z, bs = 'tp', k = ", k, ")")
+  )
+  # Country, age, gender, and education are added as in the full model.
+  reformulate(
+    c(
+      "s(country, bs = 're')",
+      personality_terms,
+      paste0("s(Dem_age_z, bs = 'tp', k = ", k, ")"),
+      "Dem_gender",
+      "Dem_edu"
+    ),
+    response = "Compliance_2"
+  )
+}
+
+# This function returns one row per personality predictor with EDF, F, p, and delta AIC.
+smooth_comparison <- function(model, predictors, k) {
+  # EDF, F, and p are taken from the model summary, and the AIC of the full model is stored.
+  smooth_names <- paste0("s(", predictors, "_z)")
+  smooth_statistics <- summary(model)$s.table[smooth_names, c("edf", "F", "p-value")]
+  full_smooth_aic <- AIC(model)
+
+  # For each predictor, the model is refitted with only that predictor entered as a straight line.
+  # Delta AIC is the AIC of that model minus the AIC of the full model. The refit uses the training data stored in the model.
+  delta_aic <- map_dbl(predictors, function(predictor) {
+    comparison_formula <- linear_formula(predictors, predictor, k)
+    linear_comparison_model <- fit_gamm(
+      comparison_formula,
+      data = model$model
+    )
+    AIC(linear_comparison_model) - full_smooth_aic
+  })
+
+  # The results are rounded for the table. p-values below .001 are written as <.001.
+  tibble(
+    predictor = predictors,
+    edf = round(smooth_statistics[, "edf"], 2),
+    F = round(smooth_statistics[, "F"], 2),
+    p = if_else(
+      smooth_statistics[, "p-value"] < 0.001,
+      "<.001",
+      format(round(smooth_statistics[, "p-value"], 3), nsmall = 3)
+    ),
+    delta_aic = round(delta_aic, 1)
+  )
+}
+```
+
+### Aligned Big Five scores
+
+The code below compares each aligned-score smooth with a linear term and prints the smooth-term summary (Supplementary Table S6).
+
+```{r}
+# The aligned-score smooths are summarised and printed in the order conscientiousness, agreeableness, openness, extraversion, and neuroticism.
+trait_smooths <- smooth_comparison(
+  trait_final$model,
+  trait_predictors,
+  k = 10
+) %>%
+  arrange(factor(predictor, levels = c("CON", "AGR", "OPE", "EXT", "NEU")))
+trait_smooths
+```
+
+### BFI-S items
+
+The code below compares each item smooth with a linear term and prints the smooth-term summary (Supplementary Table S7).
+
+```{r}
+# The item smooths are summarised and printed in item order.
+item_smooths <- smooth_comparison(
+  item_final$model,
+  item_predictors,
+  k = 5
+)
+item_smooths
+
+# The performance tables and smooth summaries are saved in one file, so they can be read without refitting.
+saveRDS(
+  list(
+    trait_cv = trait_cv,
+    trait_final = list(metrics = trait_final$metrics, delta_r2 = trait_final$delta_r2),
+    item_cv = item_cv,
+    item_final = list(metrics = item_final$metrics, delta_r2 = item_final$delta_r2),
+    trait_smooths = trait_smooths,
+    item_smooths = item_smooths
+  ),
+  "gamm_results.rds"
+)
+```

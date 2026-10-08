@@ -1,0 +1,119 @@
+---
+title: "Hierarchical structure and country sensitivity"
+output: html_document 
+---
+
+# Hierarchical structure and country sensitivity
+
+This script examines the hierarchical structure of the data. It calculates the training-set intraclass correlation of general compliance and compares two ways of representing country: a random intercept and a fixed categorical predictor (Results section).
+
+## Modelling sample
+
+The cleaning below is the same code as in Han and gives the same modelling sample as in the other analysis scripts.
+
+```{r}
+# The packages for the data, the models, the ICC, and the performance measures are loaded.
+library(tidyverse)
+library(lme4)
+library(performance)
+library(rsample)
+library(yardstick)
+
+# The aligned data are loaded.
+load("covid_aligned_BFF.RData")
+
+# Country, gender, and education are stored as factors.
+data_NEU.aligned$Country<-as.factor(data_NEU.aligned$Country)
+data_NEU.aligned$Dem_gender<-as.factor(data_NEU.aligned$Dem_gender)
+data_NEU.aligned$Dem_edu<-as.factor(data_NEU.aligned$Dem_edu)
+
+# Rows with missing age, gender, or education are removed.
+data<-data_NEU.aligned[
+  !is.na(data_NEU.aligned$Dem_age)&
+  !is.na(data_NEU.aligned$Dem_edu)&
+  !is.na(data_NEU.aligned$Dem_gender),]
+
+# Country is recoded to numbers and stored as a factor. The models use this version.
+data$country<-as.numeric(data$Country)
+data$country<-as.factor(data$country)
+```
+
+## Training set
+
+The split below gives the same training set and the same five folds as in the main analyses. The hold-out set is not used in this script.
+
+```{r}
+# This seed gives the same split as in the other analysis scripts.
+set.seed(17)
+
+# The participants are divided into a training set with 80% and a hold-out set with 20%. Only the training set is kept.
+data_split <- group_initial_split(data, group = ID, prop = 0.8)
+train_set <- training(data_split)
+
+# The training set is divided into five folds for cross-validation.
+cv_folds <- group_vfold_cv(train_set, group = ID, v = 5)
+
+# The sample size of the training set is printed.
+nrow(train_set)
+```
+
+## Intraclass correlation (ICC)
+
+An intercept-only mixed model divides the variance in general compliance into variance between countries and variance within countries. The ICC is the proportion of the variance that lies between countries (Results section).
+
+```{r}
+# The intercept-only model is fitted to the training set, and its ICC is calculated and printed.
+training_icc <- icc(lmer(Compliance_2 ~ 1 + (1 | country), data = train_set))
+training_icc
+```
+
+## Cross-validated comparison
+
+In each fold, both models are fitted to the other four folds and scored on the left-out fold. Both models contain the aligned Big Five scores, age, education, and gender. They differ only in how country is represented. The final table gives the mean RMSE, MAE, and \(R^2\) (`rsq_trad`) across the five left-out folds, rounded to three decimals (Results section).
+
+```{r}
+# This function fits both country models in one fold and calculates their performance on the left-out fold.
+compare_fold <- function(split) {
+  # The other four folds are the fitting data, and the left-out fold is the validation data.
+  training_data <- analysis(split)
+  validation_data <- assessment(split)
+
+  # The first model has country as a random intercept.
+  random_model <- lmer(
+    Compliance_2 ~ NEU + EXT + OPE + AGR + CON +
+      Dem_age + Dem_edu + Dem_gender + (1 | country),
+    data = training_data
+  )
+
+  # The second model has the same predictors, with country as a fixed categorical predictor.
+  fixed_model <- lm(
+    Compliance_2 ~ NEU + EXT + OPE + AGR + CON +
+      Dem_age + Dem_edu + Dem_gender + country,
+    data = training_data
+  )
+
+  # General compliance is predicted in the validation data with both models.
+  truth <- validation_data$Compliance_2
+  random_prediction <- predict(random_model, newdata = validation_data)
+  fixed_prediction <- predict(fixed_model, newdata = validation_data)
+
+  # RMSE, MAE, and R2 are calculated for both models and returned in one table.
+  tibble(
+    model = c("Random intercept", "Fixed country"),
+    rmse = c(rmse_vec(truth, random_prediction), rmse_vec(truth, fixed_prediction)),
+    mae = c(mae_vec(truth, random_prediction), mae_vec(truth, fixed_prediction)),
+    r2 = c(rsq_trad_vec(truth, random_prediction), rsq_trad_vec(truth, fixed_prediction))
+  )
+}
+
+# The comparison is run in all five folds. The mean of each measure is calculated, rounded to three decimals, and printed.
+cv_comparison <- map_dfr(cv_folds$splits, compare_fold) %>%
+  group_by(model) %>%
+  summarise(
+    rmse = round(mean(rmse), 3),
+    mae = round(mean(mae), 3),
+    r2 = round(mean(r2), 3)
+  )
+
+cv_comparison
+```

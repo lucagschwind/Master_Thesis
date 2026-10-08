@@ -1,0 +1,7 @@
+*.rds
+*.rds
+*.RData
+*.RData
+*.rds
+.Rhistory
+.vscode/

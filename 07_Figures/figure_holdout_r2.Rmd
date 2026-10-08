@@ -1,0 +1,144 @@
+---
+title: "Hold-out R2 by modelling approach"
+output: html_document
+---
+
+# Hold-out R2 by modelling approach
+
+This script gives the following figure: Figure 5, Hold-Out \(R^2\) by Modelling Approach and Predictor Representation (Results section).
+
+## Data
+
+The ten values below are the hold-out \(R^2\) estimates reported in Table 1. They are given in the order linear mixed-effects model, GAMM, random forest, gradient boosted trees, and neural network.
+
+```{r}
+# load required libraries
+library(tidyverse)
+
+# trait_score holds the aligned Big Five scores, and item_level holds the BFI-S items.
+holdout_r2 <- tibble(
+  model = factor(
+    c("LMM", "GAMM", "RF", "XGB", "NN"),
+    levels = c("LMM", "GAMM", "RF", "XGB", "NN")
+  ),
+  trait_score = c(0.161, 0.164, 0.165, 0.169, 0.167),
+  item_level = c(0.175, 0.179, 0.177, 0.187, 0.184)
+)
+
+# Each value becomes one row, so each point in the figure has its own row.
+holdout_r2_long <- holdout_r2 %>%
+  pivot_longer(
+    cols = c(trait_score, item_level),
+    names_to = "representation",
+    values_to = "r2"
+  ) %>%
+  mutate(
+    representation = factor(
+      representation,
+      levels = c("trait_score", "item_level"),
+      labels = c("Aligned Big Five scores", "BFI-S items")
+    )
+  )
+```
+
+## Drawing the figure
+
+```{r}
+# The black line connects the two hold-out R2 values of each modelling approach.
+figure_holdout_r2 <- ggplot() +
+  geom_segment(
+    data = holdout_r2,
+    aes(
+      x = model,
+      xend = model,
+      y = trait_score,
+      yend = item_level
+    ),
+    colour = "black",
+    linewidth = 0.6
+  ) +
+  # The points are the hold-out R2 values, coloured by predictor representation.
+  geom_point(
+    data = holdout_r2_long,
+    aes(
+      x = model,
+      y = r2,
+      colour = representation
+    ),
+    size = 3
+  ) +
+  # The aligned-score value is printed below its point.
+  geom_text(
+    data = holdout_r2_long %>%
+      filter(representation == "Aligned Big Five scores"),
+    aes(
+      x = model,
+      y = r2,
+      label = sprintf("%.3f", r2)
+    ),
+    colour = "black",
+    nudge_y = -0.0015,
+    size = 3.5
+  ) +
+  # The item value is printed above its point.
+  geom_text(
+    data = holdout_r2_long %>%
+      filter(representation == "BFI-S items"),
+    aes(
+      x = model,
+      y = r2,
+      label = sprintf("%.3f", r2)
+    ),
+    colour = "black",
+    nudge_y = 0.0015,
+    size = 3.5
+  ) +
+  # The aligned-score points are blue and the item points are orange.
+  scale_colour_manual(
+    values = c(
+      "Aligned Big Five scores" = "#1F77B4",
+      "BFI-S items" = "#FF7F0E"
+    )
+  ) +
+  # The y-axis runs from 0.15 to 0.20.
+  scale_y_continuous(
+    limits = c(0.15, 0.20),
+    breaks = seq(0.15, 0.20, by = 0.01),
+    labels = scales::label_number(accuracy = 0.01),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    x = "Modelling approach",
+    y = "Hold-out R\u00B2",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(colour = "black"),
+    axis.title = element_text(colour = "black", face = "plain"),
+    legend.position = "top",
+    legend.justification = "left",
+    plot.title = element_blank(),
+    plot.margin = margin(8, 12, 8, 8)
+  )
+
+# The figure is shown in the R output.
+figure_holdout_r2
+```
+
+## Saving the figure
+
+```{r}
+# The figure is saved as the PDF for Figure 5, Hold-Out R2 by Modelling Approach and Predictor Representation (Results section).
+dir.create("figures", showWarnings = FALSE)
+ggsave(
+  "figures/figure_holdout_r2.pdf",
+  plot = figure_holdout_r2,
+  width = 19.05,
+  height = 11.94,
+  units = "cm",
+  device = cairo_pdf
+)
+```

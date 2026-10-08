@@ -1,0 +1,513 @@
+---
+title: "Neural network"
+output: html_document
+---
+
+# Neural network
+
+This script gives the following results for the neural network, separately for the aligned Big Five scores and the BFI-S items: the nested cross-validated performance, the selected hyperparameters, the training-set and hold-out performance, and the SHAP values for the hold-out set. The performance tables, the final models, and the SHAP results are saved, so the SHAP figure scripts can read them and the results can be checked without refitting.
+
+## Modelling sample
+
+The cleaning below is the same code as in Han and gives the same modelling sample as in the other analysis scripts.
+
+```{r}
+# Load required libraries
+library(tidymodels)
+library(brulee)
+library(future)
+library(fastshap)
+
+# The aligned data are loaded.
+load("covid_aligned_BFF.RData")
+
+# Country, gender, and education are stored as factors.
+data_NEU.aligned$Country<-as.factor(data_NEU.aligned$Country)
+data_NEU.aligned$Dem_gender<-as.factor(data_NEU.aligned$Dem_gender)
+data_NEU.aligned$Dem_edu<-as.factor(data_NEU.aligned$Dem_edu)
+
+# Rows with missing age, gender, or education are removed.
+data<-data_NEU.aligned[
+  !is.na(data_NEU.aligned$Dem_age)&
+  !is.na(data_NEU.aligned$Dem_edu)&
+  !is.na(data_NEU.aligned$Dem_gender),]
+
+# Country is recoded to numbers and stored as a factor. The models use this version.
+data$country<-as.numeric(data$Country)
+data$country<-as.factor(data$country)
+```
+
+## Data splits
+
+The split below is the same participant-level split as in the other analyses. The nested cross-validation and the final tuning are done inside the training set. The hold-out set is used only for the final performance and the SHAP values (Methods section).
+
+```{r}
+# This seed gives the same split as in the other analysis scripts.
+set.seed(17)
+
+# The participants are divided into a training set with 80% and a hold-out set with 20%.
+data_split <- group_initial_split(data, group = ID, prop = 0.8)
+train_set <- training(data_split)
+holdout_set <- testing(data_split)
+
+# The training set is divided into five outer folds, and each outer training portion into ten inner folds.
+nested_folds <- nested_cv(
+  train_set,
+  outside = group_vfold_cv(group = ID, v = 5),
+  inside = group_vfold_cv(group = ID, v = 10)
+)
+
+# The sample sizes of the training set and the hold-out set are printed.
+nrow(train_set)
+nrow(holdout_set)
+```
+
+## Model specification
+
+```{r}
+# Specify neural network model
+nnet_model <- mlp(
+  hidden_units = tune(),
+  epochs = 100,
+  learn_rate = tune(),
+  penalty = tune(),
+  dropout = 0,
+  activation = "relu"
+) %>%
+  set_mode("regression") %>%
+  set_engine(
+    "brulee_two_layer",
+    hidden_units_2 = tune(),
+    activation_2 = "relu",
+    optimizer = "ADAMw",
+    batch_size = 128,
+    stop_iter = 10
+  )
+
+# The recipe standardises the numeric predictors and dummy-codes the categorical predictors.
+nnet_trait_recipe <- recipe(Compliance_2 ~ NEU + EXT + OPE + AGR + CON
+  + Dem_age + Dem_edu + Dem_gender + country, data = train_set) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+# Combine specified model and recipe into a workflow
+nnet_trait_workflow <- workflow() %>%
+  add_recipe(nnet_trait_recipe) %>%
+  add_model(nnet_model)
+
+# Grid for hyperparameter tuning
+nnet_trait_grid <- expand_grid(
+  hidden_units = c(32, 64, 128),
+  hidden_units_2 = c(32, 64, 128),
+  learn_rate = c(0.0001, 0.001, 0.01),
+  penalty = c(0.00001, 0.0001, 0.001, 0.01)
+)
+```
+
+## Nested cross-validation (aligned Big Five scores)
+
+```{r}
+# The training metrics of the outer folds are collected in this list.
+nnet_trait_outer_training_folds <- list()
+
+# In each outer fold, the hyperparameters are tuned in the inner folds and the selected pipeline is scored on the outer validation fold and the outer training portion.
+nnet_trait_outer_validation <- map_dfr(seq_along(nested_folds$splits), function(i) {
+  inner_folds <- nested_folds$inner_resamples[[i]]
+  outer_split <- nested_folds$splits[[i]]
+  
+  # A separate seed is set for each outer fold, and the candidate combinations are evaluated in parallel in ten R sessions.
+  set.seed(17 + i)
+  plan("multisession", workers = 10)
+  
+  # The hyperparameters are tuned in the ten inner folds of the outer training portion.
+  tuning_results <- tune_grid(
+    nnet_trait_workflow,
+    resamples = inner_folds,
+    grid = nnet_trait_grid,
+    metrics = yardstick::metric_set(yardstick::rmse))
+  
+  # The combination with the lowest mean RMSE is selected.
+  best_params <- select_best(tuning_results, metric = "rmse")
+  
+  # The selected pipeline is fitted to the outer training portion and scored on the outer validation fold.
+  outer_res <- last_fit(
+    finalize_workflow(nnet_trait_workflow, best_params),
+    split = outer_split,
+    metrics = yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae))
+  
+  # The outer training portion is divided into the predictors and general compliance.
+  analysis_set <- analysis(outer_split)
+  analysis_x <- select(analysis_set, -Compliance_2)
+  analysis_truth <- select(analysis_set, Compliance_2)
+
+  # RMSE, MAE, and R2 are calculated for the outer training portion.
+  analysis_metrics <- predict(
+    outer_res$.workflow[[1]],
+    new_data = analysis_x) %>%
+    bind_cols(analysis_truth) %>%
+    yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(
+      truth = Compliance_2,
+      estimate = .pred)
+  
+  # The training metrics are stored for this outer fold.
+  nnet_trait_outer_training_folds[[i]] <<- mutate(analysis_metrics, outer_fold = i)
+
+  # The validation metrics are returned with the selected hyperparameters.
+  outer_res$.metrics[[1]] %>%
+    mutate(
+      outer_fold = i,
+      best_hidden_units = best_params$hidden_units,
+      best_hidden_units_2 = best_params$hidden_units_2,
+      best_learn_rate = best_params$learn_rate,
+      best_penalty = best_params$penalty
+    )
+})
+
+# The training metrics of the five outer folds are combined.
+nnet_trait_outer_training <- bind_rows(nnet_trait_outer_training_folds)
+
+# The validation metrics and the training metrics are saved.
+saveRDS(nnet_trait_outer_validation, "nnet_trait_outer_validation.rds")
+saveRDS(nnet_trait_outer_training, "nnet_trait_outer_training.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+### Outer validation performance (aligned Big Five scores)
+
+```{r}
+# The mean and standard deviation of the validation metrics are calculated across the five outer folds.
+nnet_trait_outer_validation %>%
+  group_by(.metric) %>%
+  summarise(mean = mean(.estimate), sd = sd(.estimate), .groups = "drop")
+
+# The validation metrics of each outer fold are printed.
+print(nnet_trait_outer_validation)
+
+# The hyperparameters selected in each outer fold are printed.
+nnet_trait_outer_validation %>%
+  distinct(
+    outer_fold,
+    best_hidden_units,
+    best_hidden_units_2,
+    best_learn_rate,
+    best_penalty)
+```
+
+### Outer training performance (aligned Big Five scores)
+
+```{r}
+# The mean and standard deviation of the training metrics are calculated across the five outer folds.
+nnet_trait_outer_training %>%
+  group_by(.metric) %>%
+  summarise(
+    mean = mean(.estimate),
+    sd = sd(.estimate),
+    .groups = "drop"
+  )
+```
+
+## Final model (aligned Big Five scores)
+
+```{r}
+# The complete training set is divided into ten folds for the final hyperparameter tuning.
+set.seed(17)
+nnet_trait_tuning_folds <- group_vfold_cv(train_set, group = ID, v = 10)
+
+# The candidate combinations are evaluated in parallel in ten R sessions.
+plan("multisession", workers = 10)
+
+# The hyperparameters are tuned in the ten folds of the complete training set.
+nnet_trait_tuning <- tune_grid(
+  nnet_trait_workflow,
+  resamples = nnet_trait_tuning_folds,
+  grid = nnet_trait_grid,
+  metrics = yardstick::metric_set(yardstick::rmse)
+)
+
+# The combination with the lowest mean RMSE is selected.
+nnet_trait_selected <- select_best(nnet_trait_tuning, metric = "rmse")
+nnet_trait_selected
+
+# The selected pipeline is fitted to the complete training set and saved.
+nnet_trait_final_workflow <- finalize_workflow(nnet_trait_workflow, nnet_trait_selected)
+nnet_trait_model <- fit(nnet_trait_final_workflow, data = train_set)
+saveRDS(nnet_trait_model, "nnet_trait_model.rds")
+
+# RMSE, MAE, and R2 are calculated for the training set and saved.
+nnet_trait_training <- predict(nnet_trait_model, new_data = train_set) %>%
+  bind_cols(select(train_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+nnet_trait_training
+saveRDS(nnet_trait_training, "nnet_trait_training.rds")
+
+# RMSE, MAE, and R2 are calculated for the hold-out set and saved.
+nnet_trait_holdout <- predict(nnet_trait_model, new_data = holdout_set) %>%
+  bind_cols(select(holdout_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+
+nnet_trait_holdout
+saveRDS(nnet_trait_holdout, "nnet_trait_holdout.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+## SHAP values (aligned Big Five scores)
+
+```{r}
+# The hold-out values of the predictors in the model are selected.
+# For each hold-out participant, the SHAP value of each predictor is approximated with 50 Monte Carlo simulations.
+set.seed(17)
+nnet_trait_shap_data <- select(holdout_set, NEU, EXT, OPE, AGR, CON, Dem_age, Dem_edu, Dem_gender, country)
+nnet_trait_shap_values <- fastshap::explain(
+  object = nnet_trait_model,
+  X = nnet_trait_shap_data,
+  pred_wrapper = function(object, newdata) predict(object, new_data = newdata)$.pred,
+  nsim = 50
+)
+
+# The importance of each predictor is its mean absolute SHAP value across the hold-out participants. The predictors are sorted from the most to the least important.
+nnet_trait_shap_importance <- tibble(
+  feature = colnames(nnet_trait_shap_values),
+  mean_abs_shap = unname(colMeans(abs(nnet_trait_shap_values)))
+) %>%
+  arrange(desc(mean_abs_shap))
+
+# The five aligned scores are standardised with the training-set mean and standard deviation. Age, education, gender, and country are unchanged.
+nnet_trait_shap_data_standardised <- nnet_trait_shap_data %>%
+  mutate(across(
+    c(NEU, EXT, OPE, AGR, CON),
+    ~ (.x - mean(train_set[[cur_column()]], na.rm = TRUE)) / sd(train_set[[cur_column()]], na.rm = TRUE)
+  ))
+
+# The SHAP values, the hold-out predictor values they explain, the same values with standardised aligned scores, and the importance are saved.
+saveRDS(nnet_trait_shap_values, "nnet_trait_shap_values.rds")
+saveRDS(nnet_trait_shap_data, "nnet_trait_shap_data.rds")
+saveRDS(nnet_trait_shap_data_standardised, "nnet_trait_shap_data_standardised.rds")
+saveRDS(nnet_trait_shap_importance, "nnet_trait_shap_importance.rds")
+
+# The importance is printed (Supplementary Figure S3).
+nnet_trait_shap_importance
+```
+
+# BFI-S items
+
+## Model specification
+
+```{r}
+# The recipe standardises the numeric predictors and dummy-codes the categorical predictors.
+nnet_item_recipe <- recipe(
+  Compliance_2 ~ BFF_15_1 + BFF_15_2 + BFF_15_3 +
+    BFF_15_4 + BFF_15_5 + BFF_15_6 +
+    BFF_15_7 + BFF_15_8 + BFF_15_9 +
+    BFF_15_10 + BFF_15_11 + BFF_15_12 +
+    BFF_15_13 + BFF_15_14 + BFF_15_15 +
+    Dem_age + Dem_edu + Dem_gender + country,
+  data = train_set
+) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+# Combine specified model and recipe into a workflow
+nnet_item_workflow <- workflow() %>%
+  add_recipe(nnet_item_recipe) %>%
+  add_model(nnet_model)
+
+# Grid for hyperparameter tuning
+nnet_item_grid <- expand_grid(
+  hidden_units = c(32, 64, 128),
+  hidden_units_2 = c(32, 64, 128),
+  learn_rate = c(0.0001, 0.001, 0.01),
+  penalty = c(0.00001, 0.0001, 0.001, 0.01)
+)
+```
+
+## Nested cross-validation (BFI-S items)
+
+```{r}
+# The training metrics of the outer folds are collected in this list.
+nnet_item_outer_training_folds <- list()
+
+# In each outer fold, the hyperparameters are tuned in the inner folds and the selected pipeline is scored on the outer validation fold and the outer training portion.
+nnet_item_outer_validation <- map_dfr(seq_along(nested_folds$splits), function(i) {
+  inner_folds <- nested_folds$inner_resamples[[i]]
+  outer_split <- nested_folds$splits[[i]]
+  
+  # A separate seed is set for each outer fold, and the candidate combinations are evaluated in parallel in ten R sessions.
+  set.seed(17 + i)
+  plan("multisession", workers = 10)
+  
+  # The hyperparameters are tuned in the ten inner folds of the outer training portion.
+  tuning_results <- tune_grid(
+    nnet_item_workflow,
+    resamples = inner_folds,
+    grid = nnet_item_grid,
+    metrics = yardstick::metric_set(yardstick::rmse))
+  
+  # The combination with the lowest mean RMSE is selected.
+  best_params <- select_best(tuning_results, metric = "rmse")
+  
+  # The selected pipeline is fitted to the outer training portion and scored on the outer validation fold.
+  outer_res <- last_fit(
+    finalize_workflow(nnet_item_workflow, best_params),
+    split = outer_split,
+    metrics = yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae))
+  
+  # The outer training portion is divided into the predictors and general compliance.
+  analysis_set <- analysis(outer_split)
+  analysis_x <- select(analysis_set, -Compliance_2)
+  analysis_truth <- select(analysis_set, Compliance_2)
+
+  # RMSE, MAE, and R2 are calculated for the outer training portion.
+  analysis_metrics <- predict(
+    outer_res$.workflow[[1]],
+    new_data = analysis_x) %>%
+    bind_cols(analysis_truth) %>%
+    yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(
+      truth = Compliance_2,
+      estimate = .pred)
+  
+  # The training metrics are stored for this outer fold.
+  nnet_item_outer_training_folds[[i]] <<- mutate(analysis_metrics, outer_fold = i)
+
+  # The validation metrics are returned with the selected hyperparameters.
+  outer_res$.metrics[[1]] %>%
+    mutate(
+      outer_fold = i,
+      best_hidden_units = best_params$hidden_units,
+      best_hidden_units_2 = best_params$hidden_units_2,
+      best_learn_rate = best_params$learn_rate,
+      best_penalty = best_params$penalty
+    )
+})
+
+# The training metrics of the five outer folds are combined.
+nnet_item_outer_training <- bind_rows(nnet_item_outer_training_folds)
+
+# The validation metrics and the training metrics are saved.
+saveRDS(nnet_item_outer_validation, "nnet_item_outer_validation.rds")
+saveRDS(nnet_item_outer_training, "nnet_item_outer_training.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+### Outer validation performance (BFI-S items)
+
+```{r}
+# The mean and standard deviation of the validation metrics are calculated across the five outer folds.
+nnet_item_outer_validation %>%
+  group_by(.metric) %>%
+  summarise(mean = mean(.estimate), sd = sd(.estimate), .groups = "drop")
+
+# The validation metrics of each outer fold are printed.
+print(nnet_item_outer_validation)
+
+# The hyperparameters selected in each outer fold are printed.
+nnet_item_outer_validation %>%
+  distinct(
+    outer_fold,
+    best_hidden_units,
+    best_hidden_units_2,
+    best_learn_rate,
+    best_penalty)
+```
+
+### Outer training performance (BFI-S items)
+
+```{r}
+# The mean and standard deviation of the training metrics are calculated across the five outer folds.
+nnet_item_outer_training %>%
+  group_by(.metric) %>%
+  summarise(
+    mean = mean(.estimate),
+    sd = sd(.estimate),
+    .groups = "drop"
+  )
+```
+
+## Final model (BFI-S items)
+
+```{r}
+# The complete training set is divided into ten folds for the final hyperparameter tuning.
+set.seed(17)
+nnet_item_tuning_folds <- group_vfold_cv(train_set, group = ID, v = 10)
+
+# The candidate combinations are evaluated in parallel in ten R sessions.
+plan("multisession", workers = 10)
+
+# The hyperparameters are tuned in the ten folds of the complete training set.
+nnet_item_tuning <- tune_grid(
+  nnet_item_workflow,
+  resamples = nnet_item_tuning_folds,
+  grid = nnet_item_grid,
+  metrics = yardstick::metric_set(yardstick::rmse)
+)
+
+# The combination with the lowest mean RMSE is selected.
+nnet_item_selected <- select_best(nnet_item_tuning, metric = "rmse")
+nnet_item_selected
+
+# The selected pipeline is fitted to the complete training set and saved.
+nnet_item_final_workflow <- finalize_workflow(nnet_item_workflow, nnet_item_selected)
+nnet_item_model <- fit(nnet_item_final_workflow, data = train_set)
+saveRDS(nnet_item_model, "nnet_item_model.rds")
+
+# RMSE, MAE, and R2 are calculated for the training set and saved.
+nnet_item_training <- predict(nnet_item_model, new_data = train_set) %>%
+  bind_cols(select(train_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+nnet_item_training
+saveRDS(nnet_item_training, "nnet_item_training.rds")
+
+# RMSE, MAE, and R2 are calculated for the hold-out set and saved.
+nnet_item_holdout <- predict(nnet_item_model, new_data = holdout_set) %>%
+  bind_cols(select(holdout_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+
+nnet_item_holdout
+saveRDS(nnet_item_holdout, "nnet_item_holdout.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+## SHAP values (BFI-S items)
+
+```{r}
+# The hold-out values of the predictors in the model are selected.
+# For each hold-out participant, the SHAP value of each predictor is approximated with 50 Monte Carlo simulations.
+set.seed(17)
+nnet_item_shap_data <- select(holdout_set, all_of(paste0("BFF_15_", 1:15)), Dem_age, Dem_edu, Dem_gender, country)
+nnet_item_shap_values <- fastshap::explain(
+  object = nnet_item_model,
+  X = nnet_item_shap_data,
+  pred_wrapper = function(object, newdata) predict(object, new_data = newdata)$.pred,
+  nsim = 50
+)
+
+# The importance of each predictor is its mean absolute SHAP value across the hold-out participants. The predictors are sorted from the most to the least important.
+nnet_item_shap_importance <- tibble(
+  feature = colnames(nnet_item_shap_values),
+  mean_abs_shap = unname(colMeans(abs(nnet_item_shap_values)))
+) %>%
+  arrange(desc(mean_abs_shap))
+
+# The 15 item scores are standardised with the training-set mean and standard deviation. Age, education, gender, and country are unchanged.
+nnet_item_shap_data_standardised <- nnet_item_shap_data %>%
+  mutate(across(
+    all_of(paste0("BFF_15_", 1:15)),
+    ~ (.x - mean(train_set[[cur_column()]], na.rm = TRUE)) / sd(train_set[[cur_column()]], na.rm = TRUE)
+  ))
+
+# The SHAP values, the hold-out predictor values they explain, the same values with standardised item scores, and the importance are saved.
+saveRDS(nnet_item_shap_values, "nnet_item_shap_values.rds")
+saveRDS(nnet_item_shap_data, "nnet_item_shap_data.rds")
+saveRDS(nnet_item_shap_data_standardised, "nnet_item_shap_data_standardised.rds")
+saveRDS(nnet_item_shap_importance, "nnet_item_shap_importance.rds")
+
+# The importance is printed (Supplementary Table S8).
+nnet_item_shap_importance
+```

@@ -1,0 +1,96 @@
+---
+title: "Mean absolute SHAP values for the aligned Big Five scores"
+output: html_document
+---
+
+# Mean absolute SHAP values for the aligned Big Five scores
+
+This script gives the random-forest panel of Supplementary Figure S3, Mean Absolute SHAP Values for the Aligned Big Five Scores in the Gradient Boosted Tree, Random Forest, and Neural Network. It reads the SHAP values saved by the random forest script.
+
+```{r}
+library(ggplot2)
+library(shapviz)
+
+# The saved SHAP values and the hold-out predictor values they explain are loaded. shapviz needs both.
+rf_trait_shap_values <- readRDS("rf_trait_shap_values.rds")
+rf_trait_shap_data <- readRDS("rf_trait_shap_data.rds")
+
+# Each aligned score is linked to its trait name. This order puts conscientiousness at the top of the chart and extraversion at the bottom.
+trait_labels <- c(
+  CON = "Conscientiousness",
+  AGR = "Agreeableness",
+  OPE = "Openness",
+  NEU = "Neuroticism",
+  EXT = "Extraversion"
+)
+
+# The five aligned scores are kept, and each code is replaced by its trait name.
+shap_values <- as.matrix(rf_trait_shap_values[, names(trait_labels)])
+shap_data <- as.data.frame(rf_trait_shap_data[, names(trait_labels)])
+colnames(shap_values) <- unname(trait_labels)
+colnames(shap_data) <- unname(trait_labels)
+```
+
+## Drawing the figure
+
+```{r}
+# shapviz draws the original bar chart. The length of each bar is the mean absolute SHAP value of that trait.
+# The bars are grey and keep the order of the trait list instead of being sorted by size.
+figure_shap_importance <- sv_importance(
+  shapviz(shap_values, X = shap_data),
+  kind = "bar",
+  fill = "grey70",
+  bar_width = 0.62,
+  show_numbers = FALSE,
+  sort_features = FALSE
+)
+
+# The original chart is then adjusted.
+figure_shap_importance <- figure_shap_importance +
+  # The mean absolute SHAP value of each bar is printed with three decimals just to the right of the bar.
+  geom_text(
+    aes(label = sprintf("%.3f", value)),
+    hjust = 0,
+    nudge_x = 0.004,
+    family = "Arial",
+    size = 3.5,
+    colour = "black"
+  ) +
+  # The x-axis runs from 0 to 0.18, with labels at 0, 0.05, 0.10, and 0.15. Its title names the mean absolute SHAP value.
+  scale_x_continuous(
+    limits = c(0, 0.18),
+    breaks = seq(0, 0.15, by = 0.05),
+    labels = scales::label_number(accuracy = 0.01),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(x = "Mean absolute SHAP value", y = NULL) +
+  # A minimal theme is used. The horizontal grid lines and the minor grid lines are removed, so only vertical grid lines remain.
+  theme_minimal(base_size = 11, base_family = "Arial") +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(colour = "black"),
+    axis.title = element_text(colour = "black", face = "plain"),
+    plot.title = element_blank(),
+    plot.margin = margin(8, 12, 8, 8)
+  )
+
+# The figure is shown in the R output.
+figure_shap_importance
+```
+
+## Saving the figure
+
+```{r}
+# The figure is saved as the PDF for the random-forest panel of Supplementary Figure S3.
+dir.create("figures", showWarnings = FALSE)
+
+ggsave(
+  filename = "figures/figure_shap_trait_importance_rf.pdf",
+  plot = figure_shap_importance,
+  width = 19.05,
+  height = 9.65,
+  units = "cm",
+  device = cairo_pdf
+)
+```

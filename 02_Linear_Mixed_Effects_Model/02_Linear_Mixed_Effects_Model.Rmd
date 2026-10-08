@@ -1,0 +1,220 @@
+---
+title: "Linear mixed-effects model"
+output: html_document 
+---
+
+# Linear mixed-effects model
+
+This script gives the following results for the linear mixed-effects model, separately for the aligned Big Five scores and the BFI-S items: the cross-validated performance, the training-set and hold-out performance, and the fixed-effect coefficients.
+
+## Modelling sample
+
+The cleaning below is the same code as in Han and gives the same modelling sample as in the other analysis scripts.
+
+```{r}
+# The packages for the data, the model, and the performance measures are loaded.
+library(tidyverse)
+library(lme4)
+library(rsample)
+library(yardstick)
+
+# The aligned data are loaded.
+load("covid_aligned_BFF.RData")
+
+# Country, gender, and education are stored as factors.
+data_NEU.aligned$Country<-as.factor(data_NEU.aligned$Country)
+data_NEU.aligned$Dem_gender<-as.factor(data_NEU.aligned$Dem_gender)
+data_NEU.aligned$Dem_edu<-as.factor(data_NEU.aligned$Dem_edu)
+
+# Rows with missing age, gender, or education are removed.
+data<-data_NEU.aligned[
+  !is.na(data_NEU.aligned$Dem_age)&
+  !is.na(data_NEU.aligned$Dem_edu)&
+  !is.na(data_NEU.aligned$Dem_gender),]
+
+# Country is recoded to numbers and stored as a factor. The models use this version.
+data$country<-as.numeric(data$Country)
+data$country<-as.factor(data$country)
+```
+
+## Training set
+
+The split below is the same participant-level split as in the other analyses. Cross-validation is done inside the training set. The hold-out set is used only for the final performance (Methods section).
+
+```{r}
+# This seed gives the same split as in the other analysis scripts.
+set.seed(17)
+
+# The participants are divided into a training set with 80% and a hold-out set with 20%.
+data_split <- group_initial_split(data, group = ID, prop = 0.8)
+train_set <- training(data_split)
+holdout_set <- testing(data_split)
+
+# The training set is divided into five folds for cross-validation.
+cv_folds <- group_vfold_cv(train_set, group = ID, v = 5)
+
+# The sample sizes of the training set and the hold-out set are printed.
+nrow(train_set)
+nrow(holdout_set)
+```
+
+## Models
+
+Both models contain a linear effect for each personality predictor and for age. Gender and education are categorical predictors, and country is a random intercept. The two models differ only in the personality predictors.
+
+```{r}
+# The personality predictors of the two models are the five aligned scores and the 15 items.
+trait_predictors <- c("NEU", "EXT", "OPE", "AGR", "CON")
+item_predictors <- paste0("BFF_15_", 1:15)
+
+# The aligned-score model contains the five aligned scores, age, education, gender, and a random intercept for country.
+trait_formula <- Compliance_2 ~ NEU + EXT + OPE + AGR + CON +
+  Dem_age + Dem_edu + Dem_gender + (1 | country)
+
+# The item model contains the 15 items, age, education, gender, and a random intercept for country.
+item_formula <- Compliance_2 ~ BFF_15_1 + BFF_15_2 + BFF_15_3 + BFF_15_4 + BFF_15_5 +
+  BFF_15_6 + BFF_15_7 + BFF_15_8 + BFF_15_9 + BFF_15_10 + BFF_15_11 +
+  BFF_15_12 + BFF_15_13 + BFF_15_14 + BFF_15_15 +
+  Dem_age + Dem_edu + Dem_gender + (1 | country)
+```
+
+## Performance
+
+The same three functions are used for both predictor representations. `evaluate()` fits one model and calculates its performance. `cross_validate()` repeats this in the five training-set folds. `final_performance()` fits the model once to the complete training set and scores it on the hold-out set. \(R^2\) is calculated with `rsq_trad`. In the printed tables, Assessment is the left-out fold during cross-validation and the hold-out set in the final performance.
+
+```{r}
+# RMSE, MAE, and R2 are the performance measures. rmse and mae are taken from yardstick.
+performance_metrics <- metric_set(yardstick::rmse, yardstick::mae, rsq_trad)
+
+# This function fits one model and calculates its performance in the fitting data and in new data.
+# The new data are the left-out fold during cross-validation and the hold-out set in the final performance.
+evaluate <- function(formula, predictors, fit_data, new_data) {
+  # Age and the personality predictors are standardised in both data sets with the mean and standard deviation of the fitting data.
+  numeric_predictors <- c(predictors, "Dem_age")
+  centre <- map_dbl(fit_data[numeric_predictors], mean)
+  spread <- map_dbl(fit_data[numeric_predictors], sd)
+  fit_data[numeric_predictors] <- scale(fit_data[numeric_predictors], centre, spread)
+  new_data[numeric_predictors] <- scale(new_data[numeric_predictors], centre, spread)
+
+  # The model is fitted, and general compliance is predicted in both data sets.
+  model <- lmer(formula, data = fit_data)
+  fit_data$.pred <- predict(model, newdata = fit_data)
+  new_data$.pred <- predict(model, newdata = new_data)
+
+  # RMSE, MAE, and R2 are calculated in both data sets, labelled Training and Assessment, and returned.
+  bind_rows(
+    Training = performance_metrics(fit_data, Compliance_2, .pred),
+    Assessment = performance_metrics(new_data, Compliance_2, .pred),
+    .id = "set"
+  )
+}
+
+# This function runs the five-fold cross-validation and summarises the performance.
+cross_validate <- function(formula, predictors) {
+  # In each fold, the model is fitted to the other four folds and scored on the left-out fold.
+  folds <- map_dfr(
+    cv_folds$splits,
+    ~ evaluate(formula, predictors, analysis(.x), assessment(.x)),
+    .id = "fold"
+  )
+
+  # The mean and standard deviation across the five folds are calculated and rounded to three decimals.
+  cv_summary <- folds %>%
+    group_by(set, .metric) %>%
+    summarise(mean = round(mean(.estimate), 3), sd = round(sd(.estimate), 3), .groups = "drop")
+
+  # In each fold, the validation R2 is subtracted from the training R2.
+  # The mean and standard deviation of this difference are then calculated.
+  delta_r2 <- folds %>%
+    filter(.metric == "rsq_trad") %>%
+    pivot_wider(id_cols = fold, names_from = set, values_from = .estimate) %>%
+    summarise(mean = round(mean(Training - Assessment), 3), sd = round(sd(Training - Assessment), 3))
+
+  # The performance summary and the R2 difference are returned.
+  list(summary = cv_summary, delta_r2 = delta_r2)
+}
+
+# This function fits the model once to the complete training set and scores it on the hold-out set.
+final_performance <- function(formula, predictors) {
+  results <- evaluate(formula, predictors, train_set, holdout_set)
+
+  # The unrounded training R2 and hold-out R2 are extracted.
+  training_r2 <- results %>%
+    filter(set == "Training", .metric == "rsq_trad") %>%
+    pull(.estimate)
+  holdout_r2 <- results %>%
+    filter(set == "Assessment", .metric == "rsq_trad") %>%
+    pull(.estimate)
+
+  # The rounded performance and the R2 difference are returned.
+  # The R2 difference is calculated from the unrounded values and then rounded.
+  list(
+    metrics = mutate(results, .estimate = round(.estimate, 3)),
+    delta_r2 = round(training_r2 - holdout_r2, 3)
+  )
+}
+```
+
+### Aligned Big Five scores
+
+The code below first calculates the cross-validated performance and then the training-set and hold-out performance for the aligned Big Five scores (Supplementary Table S4, then Table 1 and Supplementary Table S3).
+
+```{r}
+# The cross-validated performance is calculated and printed (Supplementary Table S4).
+trait_cv <- cross_validate(trait_formula, trait_predictors)
+trait_cv
+
+# The training-set and hold-out performance and the R2 difference are calculated and printed (Table 1; Supplementary Table S3).
+trait_final <- final_performance(trait_formula, trait_predictors)
+trait_final
+```
+
+### BFI-S items
+
+The code below first calculates the cross-validated performance and then the training-set and hold-out performance for the BFI-S items (Supplementary Table S4, then Table 1 and Supplementary Table S3).
+
+```{r}
+# The cross-validated performance is calculated and printed (Supplementary Table S4).
+item_cv <- cross_validate(item_formula, item_predictors)
+item_cv
+
+# The training-set and hold-out performance and the R2 difference are calculated and printed (Table 1; Supplementary Table S3).
+item_final <- final_performance(item_formula, item_predictors)
+item_final
+```
+
+## Coefficients
+
+The coefficients come from the same two models, fitted once to the complete training set with the original, unstandardised predictor values. \(B\) is the unstandardised coefficient, and SE is its standard error. beta is the standardised coefficient, \(B \times \mathrm{SD}_x / \mathrm{SD}_y\), where \(x\) is the predictor and \(y\) is general compliance (Table 2; Supplementary Table S5).
+
+```{r}
+# This function returns B, SE, and beta for the given predictors.
+coefficients_table <- function(formula, predictors) {
+  # The model is fitted to the training set with the original predictor values.
+  model <- lmer(formula, data = train_set)
+
+  # B and its standard error are taken from the model summary.
+  estimates <- coef(summary(model))[predictors, ]
+  B <- estimates[, "Estimate"]
+  SE <- estimates[, "Std. Error"]
+
+  # beta is B multiplied by the standard deviation of the predictor and divided by the standard deviation of general compliance.
+  predictor_sd <- map_dbl(train_set[predictors], sd)
+  outcome_sd <- sd(train_set$Compliance_2)
+  beta <- B * predictor_sd / outcome_sd
+
+  # The coefficients are rounded to three decimals and returned in one table.
+  tibble(
+    predictor = predictors,
+    B = round(unname(B), 3),
+    SE = round(unname(SE), 3),
+    beta = round(unname(beta), 3)
+  )
+}
+
+# The coefficients of the five aligned scores are printed in the order of Table 2.
+coefficients_table(trait_formula, c("CON", "AGR", "OPE", "EXT", "NEU"))
+
+# The coefficients of the 15 BFI-S items are printed in the order of Supplementary Table S5.
+coefficients_table(item_formula, item_predictors)
+```

@@ -1,0 +1,516 @@
+---
+title: "Gradient boosted trees"
+output: html_document
+---
+
+# Gradient boosted trees
+
+This script gives the following results for the gradient boosted trees, separately for the aligned Big Five scores and the BFI-S items: the nested cross-validated performance, the selected hyperparameters, the training-set and hold-out performance, and the SHAP values for the hold-out set. The performance tables, the final models, and the SHAP results are saved, so the SHAP figure scripts can read them and the results can be checked without refitting.
+
+## Modelling sample
+
+The cleaning below is the same code as in Han and gives the same modelling sample as in the other analysis scripts.
+
+```{r}
+# Load required libraries
+library(tidymodels)
+library(xgboost)
+library(future)
+library(fastshap)
+
+# The aligned data are loaded.
+load("covid_aligned_BFF.RData")
+
+# Country, gender, and education are stored as factors.
+data_NEU.aligned$Country<-as.factor(data_NEU.aligned$Country)
+data_NEU.aligned$Dem_gender<-as.factor(data_NEU.aligned$Dem_gender)
+data_NEU.aligned$Dem_edu<-as.factor(data_NEU.aligned$Dem_edu)
+
+# Rows with missing age, gender, or education are removed.
+data<-data_NEU.aligned[
+  !is.na(data_NEU.aligned$Dem_age)&
+  !is.na(data_NEU.aligned$Dem_edu)&
+  !is.na(data_NEU.aligned$Dem_gender),]
+
+# Country is recoded to numbers and stored as a factor. The models use this version.
+data$country<-as.numeric(data$Country)
+data$country<-as.factor(data$country)
+```
+
+## Data splits
+
+The split below is the same participant-level split as in the other analyses. The nested cross-validation and the final tuning are done inside the training set. The hold-out set is used only for the final performance and the SHAP values (Methods section).
+
+```{r}
+# This seed gives the same split as in the other analysis scripts.
+set.seed(17)
+
+# The participants are divided into a training set with 80% and a hold-out set with 20%.
+data_split <- group_initial_split(data, group = ID, prop = 0.8)
+train_set <- training(data_split)
+holdout_set <- testing(data_split)
+
+# The training set is divided into five outer folds, and each outer training portion into ten inner folds.
+nested_folds <- nested_cv(
+  train_set,
+  outside = group_vfold_cv(group = ID, v = 5),
+  inside = group_vfold_cv(group = ID, v = 10)
+)
+
+# The sample sizes of the training set and the hold-out set are printed.
+nrow(train_set)
+nrow(holdout_set)
+```
+
+## Model specification
+
+```{r}
+# Specify gradient boosted tree model
+xgb_model <- boost_tree(
+  trees = 1000,
+  learn_rate = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  sample_size = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("xgboost",
+             objective = "reg:squarederror",
+             colsample_bytree = tune(),
+             counts = FALSE)
+
+# The recipe standardises the numeric predictors and dummy-codes the categorical predictors.
+xgb_trait_recipe <- recipe(Compliance_2 ~ NEU + EXT + OPE + AGR + CON
+  + Dem_age + Dem_edu + Dem_gender + country, data = train_set) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+# Combine specified model and recipe into a workflow
+xgb_trait_workflow <- workflow() %>%
+  add_recipe(xgb_trait_recipe) %>%
+  add_model(xgb_model)
+
+# Grid for hyperparameter tuning
+xgb_trait_grid <- grid_space_filling(
+  parameters(
+    learn_rate(range = c(-3, -0.5)),
+    tree_depth(range = c(3, 15)),
+    min_n(range = c(5, 100)),
+    sample_size = sample_prop(range = c(0.1, 1)),
+    colsample_bytree = sample_prop(range = c(0.6, 1))
+  ),
+  size = 100)
+```
+
+## Nested cross-validation (aligned Big Five scores)
+```{r}
+# The training metrics of the outer folds are collected in this list.
+xgb_trait_outer_training_folds <- list()
+
+# In each outer fold, the hyperparameters are tuned in the inner folds and the selected pipeline is scored on the outer validation fold and the outer training portion.
+xgb_trait_outer_validation <- map_dfr(seq_along(nested_folds$splits), function(i) {
+  inner_folds <- nested_folds$inner_resamples[[i]]
+  outer_split <- nested_folds$splits[[i]]
+  
+  # A separate seed is set for each outer fold, and the candidate combinations are evaluated in parallel in ten R sessions.
+  set.seed(17 + i)
+  plan("multisession", workers = 10)
+  
+  # The hyperparameters are tuned in the ten inner folds of the outer training portion.
+  tuning_results <- tune_grid(
+    xgb_trait_workflow,
+    resamples = inner_folds,
+    grid = xgb_trait_grid,
+    metrics = yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae))
+  
+  # The combination with the lowest mean RMSE is selected.
+  best_params <- select_best(tuning_results, metric = "rmse")
+  
+  # The selected pipeline is fitted to the outer training portion and scored on the outer validation fold.
+  outer_res <- last_fit(
+    finalize_workflow(xgb_trait_workflow, best_params),
+    split = outer_split,
+    metrics = yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae))
+  
+  # The outer training portion is divided into the predictors and general compliance.
+  analysis_set <- analysis(outer_split)
+  analysis_x <- select(analysis_set, -Compliance_2)
+  analysis_truth <- select(analysis_set, Compliance_2)
+  
+  # RMSE, MAE, and R2 are calculated for the outer training portion.
+  analysis_metrics <- predict(
+    outer_res$.workflow[[1]],
+    new_data = analysis_x) %>%
+    bind_cols(analysis_truth) %>%
+    yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(
+      truth = Compliance_2,
+      estimate = .pred)
+  
+  # The training metrics are stored for this outer fold.
+  xgb_trait_outer_training_folds[[i]] <<- mutate(analysis_metrics, outer_fold = i)
+  
+  # The validation metrics are returned with the selected hyperparameters.
+  outer_res$.metrics[[1]] %>%
+    mutate(
+      outer_fold        = i,
+      best_learn_rate   = best_params$learn_rate,
+      best_tree_depth   = best_params$tree_depth,
+      best_min_n        = best_params$min_n,
+      best_sample_size  = best_params$sample_size,
+      best_colsample_bt = best_params$colsample_bytree
+    )
+})
+
+# The training metrics of the five outer folds are combined.
+xgb_trait_outer_training <- bind_rows(xgb_trait_outer_training_folds)
+
+# The validation metrics and the training metrics are saved.
+saveRDS(xgb_trait_outer_validation, "xgb_trait_outer_validation.rds")
+saveRDS(xgb_trait_outer_training, "xgb_trait_outer_training.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+### Outer validation performance (aligned Big Five scores)
+
+```{r}
+# The mean and standard deviation of the validation metrics are calculated across the five outer folds.
+xgb_trait_outer_validation %>%
+  group_by(.metric) %>%
+  summarise(mean = mean(.estimate), sd = sd(.estimate), .groups = "drop")
+
+# The validation metrics of each outer fold are printed.
+print(xgb_trait_outer_validation)
+
+# The hyperparameters selected in each outer fold are printed.
+xgb_trait_outer_validation %>%
+  distinct(
+    outer_fold,
+    best_learn_rate,
+    best_tree_depth,
+    best_min_n,
+    best_sample_size,
+    best_colsample_bt)
+```
+
+### Outer training performance (aligned Big Five scores)
+
+```{r}
+# The mean and standard deviation of the training metrics are calculated across the five outer folds.
+xgb_trait_outer_training %>%
+  group_by(.metric) %>%
+  summarise(
+    mean = mean(.estimate),
+    sd = sd(.estimate),
+    .groups = "drop"
+  )
+```
+
+## Final model (aligned Big Five scores)
+
+```{r}
+# The complete training set is divided into ten folds for the final hyperparameter tuning.
+set.seed(17)
+xgb_trait_tuning_folds <- group_vfold_cv(train_set, group = ID, v = 10)
+
+# The candidate combinations are evaluated in parallel in ten R sessions.
+plan("multisession", workers = 10)
+
+# The hyperparameters are tuned in the ten folds of the complete training set.
+xgb_trait_tuning <- tune_grid(
+  xgb_trait_workflow,
+  resamples = xgb_trait_tuning_folds,
+  grid = xgb_trait_grid,
+  metrics = yardstick::metric_set(yardstick::rmse)
+)
+
+# The combination with the lowest mean RMSE is selected.
+xgb_trait_selected <- select_best(xgb_trait_tuning, metric = "rmse")
+xgb_trait_selected
+
+# The selected pipeline is fitted to the complete training set and saved.
+xgb_trait_final_workflow <- finalize_workflow(xgb_trait_workflow, xgb_trait_selected)
+xgb_trait_model <- fit(xgb_trait_final_workflow, data = train_set)
+saveRDS(xgb_trait_model, "xgb_trait_model.rds")
+
+# RMSE, MAE, and R2 are calculated for the training set and saved.
+xgb_trait_training <- predict(xgb_trait_model, new_data = train_set) %>%
+  bind_cols(select(train_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+xgb_trait_training
+saveRDS(xgb_trait_training, "xgb_trait_training.rds")
+
+# RMSE, MAE, and R2 are calculated for the hold-out set and saved.
+xgb_trait_holdout <- predict(xgb_trait_model, new_data = holdout_set) %>%
+  bind_cols(select(holdout_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+
+xgb_trait_holdout
+saveRDS(xgb_trait_holdout, "xgb_trait_holdout.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+## SHAP values (aligned Big Five scores)
+
+```{r}
+# The hold-out values of the predictors in the model are selected.
+# For each hold-out participant, the SHAP value of each predictor is approximated with 50 Monte Carlo simulations.
+set.seed(17)
+xgb_trait_shap_data <- select(holdout_set, NEU, EXT, OPE, AGR, CON, Dem_age, Dem_edu, Dem_gender, country)
+xgb_trait_shap_values <- fastshap::explain(
+  object = xgb_trait_model,
+  X = xgb_trait_shap_data,
+  pred_wrapper = function(object, newdata) predict(object, new_data = newdata)$.pred,
+  nsim = 50
+)
+
+# The importance of each predictor is its mean absolute SHAP value across the hold-out participants. The predictors are sorted from the most to the least important.
+xgb_trait_shap_importance <- tibble(
+  feature = colnames(xgb_trait_shap_values),
+  mean_abs_shap = unname(colMeans(abs(xgb_trait_shap_values)))
+) %>%
+  arrange(desc(mean_abs_shap))
+
+# The five aligned scores are standardised with the training-set mean and standard deviation. Age, education, gender, and country are unchanged.
+xgb_trait_shap_data_standardised <- xgb_trait_shap_data %>%
+  mutate(across(
+    c(NEU, EXT, OPE, AGR, CON),
+    ~ (.x - mean(train_set[[cur_column()]], na.rm = TRUE)) / sd(train_set[[cur_column()]], na.rm = TRUE)
+  ))
+
+# The SHAP values, the hold-out predictor values they explain, the same values with standardised aligned scores, and the importance are saved.
+saveRDS(xgb_trait_shap_values, "xgb_trait_shap_values.rds")
+saveRDS(xgb_trait_shap_data, "xgb_trait_shap_data.rds")
+saveRDS(xgb_trait_shap_data_standardised, "xgb_trait_shap_data_standardised.rds")
+saveRDS(xgb_trait_shap_importance, "xgb_trait_shap_importance.rds")
+
+# The importance is printed (Figure 7; Supplementary Figure S3).
+xgb_trait_shap_importance
+```
+
+# BFI-S items
+
+## Model specification
+
+```{r}
+# The recipe standardises the numeric predictors and dummy-codes the categorical predictors.
+xgb_item_recipe <- recipe(
+  Compliance_2 ~ BFF_15_1 + BFF_15_2 + BFF_15_3 +
+    BFF_15_4 + BFF_15_5 + BFF_15_6 +
+    BFF_15_7 + BFF_15_8 + BFF_15_9 +
+    BFF_15_10 + BFF_15_11 + BFF_15_12 +
+    BFF_15_13 + BFF_15_14 + BFF_15_15 +
+    Dem_age + Dem_edu + Dem_gender + country,
+  data = train_set
+) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+# Combine specified model and recipe into a workflow
+xgb_item_workflow <- workflow() %>%
+  add_recipe(xgb_item_recipe) %>%
+  add_model(xgb_model)
+
+# Grid for hyperparameter tuning
+xgb_item_grid <- grid_space_filling(
+  parameters(
+    learn_rate(range = c(-3, -0.5)),
+    tree_depth(range = c(3, 15)),
+    min_n(range = c(5, 100)),
+    sample_size = sample_prop(range = c(0.1, 1)),
+    colsample_bytree = sample_prop(range = c(0.6, 1))
+  ),
+  size = 100)
+```
+
+## Nested cross-validation (BFI-S items)
+
+```{r}
+# The training metrics of the outer folds are collected in this list.
+xgb_item_outer_training_folds <- list()
+
+# In each outer fold, the hyperparameters are tuned in the inner folds and the selected pipeline is scored on the outer validation fold and the outer training portion.
+xgb_item_outer_validation <- map_dfr(seq_along(nested_folds$splits), function(i) {
+  inner_folds <- nested_folds$inner_resamples[[i]]
+  outer_split <- nested_folds$splits[[i]]
+
+  # A separate seed is set for each outer fold, and the candidate combinations are evaluated in parallel in ten R sessions.
+  set.seed(17 + i)
+  plan("multisession", workers = 10)
+
+  # The hyperparameters are tuned in the ten inner folds of the outer training portion.
+  tuning_results <- tune_grid(
+    xgb_item_workflow,
+    resamples = inner_folds,
+    grid = xgb_item_grid,
+    metrics = yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae))
+
+  # The combination with the lowest mean RMSE is selected.
+  best_params <- select_best(tuning_results, metric = "rmse")
+
+  # The selected pipeline is fitted to the outer training portion and scored on the outer validation fold.
+  outer_res <- last_fit(
+    finalize_workflow(xgb_item_workflow, best_params),
+    split = outer_split,
+    metrics = yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae))
+
+  # The outer training portion is divided into the predictors and general compliance.
+  analysis_set <- analysis(outer_split)
+  analysis_x <- select(analysis_set, -Compliance_2)
+  analysis_truth <- select(analysis_set, Compliance_2)
+
+  # RMSE, MAE, and R2 are calculated for the outer training portion.
+  analysis_metrics <- predict(
+    outer_res$.workflow[[1]],
+    new_data = analysis_x) %>%
+    bind_cols(analysis_truth) %>%
+    yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(
+      truth = Compliance_2,
+      estimate = .pred)
+
+  # The training metrics are stored for this outer fold.
+  xgb_item_outer_training_folds[[i]] <<- mutate(analysis_metrics, outer_fold = i)
+
+  # The validation metrics are returned with the selected hyperparameters.
+  outer_res$.metrics[[1]] %>%
+    mutate(
+      outer_fold        = i,
+      best_learn_rate   = best_params$learn_rate,
+      best_tree_depth   = best_params$tree_depth,
+      best_min_n        = best_params$min_n,
+      best_sample_size  = best_params$sample_size,
+      best_colsample_bt = best_params$colsample_bytree
+    )
+})
+
+# The training metrics of the five outer folds are combined.
+xgb_item_outer_training <- bind_rows(xgb_item_outer_training_folds)
+
+# The validation metrics and the training metrics are saved.
+saveRDS(xgb_item_outer_validation, "xgb_item_outer_validation.rds")
+saveRDS(xgb_item_outer_training, "xgb_item_outer_training.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+### Outer validation performance (BFI-S items)
+
+```{r}
+# The mean and standard deviation of the validation metrics are calculated across the five outer folds.
+xgb_item_outer_validation %>%
+  group_by(.metric) %>%
+  summarise(mean = mean(.estimate), sd = sd(.estimate), .groups = "drop")
+
+# The validation metrics of each outer fold are printed.
+print(xgb_item_outer_validation)
+
+# The hyperparameters selected in each outer fold are printed.
+xgb_item_outer_validation %>%
+  distinct(
+    outer_fold,
+    best_learn_rate,
+    best_tree_depth,
+    best_min_n,
+    best_sample_size,
+    best_colsample_bt)
+```
+
+### Outer training performance (BFI-S items)
+
+```{r}
+# The mean and standard deviation of the training metrics are calculated across the five outer folds.
+xgb_item_outer_training %>%
+  group_by(.metric) %>%
+  summarise(
+    mean = mean(.estimate),
+    sd = sd(.estimate),
+    .groups = "drop"
+  )
+```
+
+## Final model (BFI-S items)
+
+```{r}
+# The complete training set is divided into ten folds for the final hyperparameter tuning.
+set.seed(17)
+xgb_item_tuning_folds <- group_vfold_cv(train_set, group = ID, v = 10)
+
+# The candidate combinations are evaluated in parallel in ten R sessions.
+plan("multisession", workers = 10)
+
+# The hyperparameters are tuned in the ten folds of the complete training set.
+xgb_item_tuning <- tune_grid(
+  xgb_item_workflow,
+  resamples = xgb_item_tuning_folds,
+  grid = xgb_item_grid,
+  metrics = yardstick::metric_set(yardstick::rmse)
+)
+
+# The combination with the lowest mean RMSE is selected.
+xgb_item_selected <- select_best(xgb_item_tuning, metric = "rmse")
+xgb_item_selected
+
+# The selected pipeline is fitted to the complete training set and saved.
+xgb_item_final_workflow <- finalize_workflow(xgb_item_workflow, xgb_item_selected)
+xgb_item_model <- fit(xgb_item_final_workflow, data = train_set)
+saveRDS(xgb_item_model, "xgb_item_model.rds")
+
+# RMSE, MAE, and R2 are calculated for the training set and saved.
+xgb_item_training <- predict(xgb_item_model, new_data = train_set) %>%
+  bind_cols(select(train_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+xgb_item_training
+saveRDS(xgb_item_training, "xgb_item_training.rds")
+
+# RMSE, MAE, and R2 are calculated for the hold-out set and saved.
+xgb_item_holdout <- predict(xgb_item_model, new_data = holdout_set) %>%
+  bind_cols(select(holdout_set, Compliance_2)) %>%
+  yardstick::metric_set(yardstick::rmse, yardstick::rsq_trad, yardstick::mae)(truth = Compliance_2, estimate = .pred)
+
+xgb_item_holdout
+saveRDS(xgb_item_holdout, "xgb_item_holdout.rds")
+
+# The parallel sessions are closed.
+plan("sequential")
+```
+
+## SHAP values (BFI-S items)
+
+```{r}
+# The hold-out values of the predictors in the model are selected.
+# For each hold-out participant, the SHAP value of each predictor is approximated with 50 Monte Carlo simulations.
+set.seed(17)
+xgb_item_shap_data <- select(holdout_set, all_of(paste0("BFF_15_", 1:15)), Dem_age, Dem_edu, Dem_gender, country)
+xgb_item_shap_values <- fastshap::explain(
+  object = xgb_item_model,
+  X = xgb_item_shap_data,
+  pred_wrapper = function(object, newdata) predict(object, new_data = newdata)$.pred,
+  nsim = 50
+)
+
+# The importance of each predictor is its mean absolute SHAP value across the hold-out participants. The predictors are sorted from the most to the least important.
+xgb_item_shap_importance <- tibble(
+  feature = colnames(xgb_item_shap_values),
+  mean_abs_shap = unname(colMeans(abs(xgb_item_shap_values)))
+) %>%
+  arrange(desc(mean_abs_shap))
+
+# The 15 item scores are standardised with the training-set mean and standard deviation. Age, education, gender, and country are unchanged.
+xgb_item_shap_data_standardised <- xgb_item_shap_data %>%
+  mutate(across(
+    all_of(paste0("BFF_15_", 1:15)),
+    ~ (.x - mean(train_set[[cur_column()]], na.rm = TRUE)) / sd(train_set[[cur_column()]], na.rm = TRUE)
+  ))
+
+# The SHAP values, the hold-out predictor values they explain, the same values with standardised item scores, and the importance are saved.
+saveRDS(xgb_item_shap_values, "xgb_item_shap_values.rds")
+saveRDS(xgb_item_shap_data, "xgb_item_shap_data.rds")
+saveRDS(xgb_item_shap_data_standardised, "xgb_item_shap_data_standardised.rds")
+saveRDS(xgb_item_shap_importance, "xgb_item_shap_importance.rds")
+
+# The importance is printed (Supplementary Table S8).
+xgb_item_shap_importance
+```

@@ -1,0 +1,165 @@
+---
+title: "Descriptive statistics"
+output: html_document
+---
+
+# Descriptive statistics
+
+This script gives the following descriptives of the modelling sample: the sample size, the demographic characteristics, and the distribution of general compliance.
+
+## Modelling sample
+
+The cleaning below is the same code as in Han and gives the same modelling sample as in the other analysis scripts. The last two lines print the number of participants and the number of countries (Methods section).
+
+```{r}
+# The packages for the data and the figure are loaded.
+library(tidyverse)
+library(scales)
+
+# The aligned data are loaded.
+load("covid_aligned_BFF.RData")
+
+# Country, gender, and education are stored as factors.
+data_NEU.aligned$Country<-as.factor(data_NEU.aligned$Country)
+data_NEU.aligned$Dem_gender<-as.factor(data_NEU.aligned$Dem_gender)
+data_NEU.aligned$Dem_edu<-as.factor(data_NEU.aligned$Dem_edu)
+
+# Rows with missing age, gender, or education are removed.
+data<-data_NEU.aligned[
+  !is.na(data_NEU.aligned$Dem_age)&
+  !is.na(data_NEU.aligned$Dem_edu)&
+  !is.na(data_NEU.aligned$Dem_gender),]
+
+# Country is recoded to numbers and stored as a factor, as in the other analysis scripts.
+data$country<-as.numeric(data$Country)
+data$country<-as.factor(data$country)
+
+# The number of participants and the number of countries are printed.
+nrow(data)
+n_distinct(data$Country)
+```
+
+## Sample characteristics
+
+The first table describes the full sample, and the second table describes each country (Supplementary Table S1). `n` is the number of participants. `age_m` and `age_sd` are the mean and standard deviation of age in years. The other columns count the participants in each gender and education category.
+
+```{r}
+# The sample size, the mean and standard deviation of age, and the gender and education counts are calculated for the full sample.
+data %>%
+  summarise(
+    n = n(),
+    age_m = round(mean(Dem_age), 2),
+    age_sd = round(sd(Dem_age), 2),
+    female = sum(Dem_gender == "Female"),
+    male = sum(Dem_gender == "Male"),
+    other = sum(Dem_gender == "Other/would rather not say"),
+    phd = sum(Dem_edu == "PhD/Doctorate"),
+    college = sum(Dem_edu == "College degree, bachelor, master"),
+    some_college = sum(Dem_edu == "Some College, short continuing education or equivalent"),
+    school_12 = sum(Dem_edu == "Up to 12 years of school"),
+    school_9 = sum(Dem_edu == "Up to 9 years of school"),
+    school_6 = sum(Dem_edu == "Up to 6 years of school"),
+    none = sum(Dem_edu == "None")
+  )
+
+# The same characteristics are calculated for each country.
+data %>%
+  group_by(Country) %>%
+  summarise(
+    n = n(),
+    age_m = round(mean(Dem_age), 2),
+    age_sd = round(sd(Dem_age), 2),
+    female = sum(Dem_gender == "Female"),
+    male = sum(Dem_gender == "Male"),
+    other = sum(Dem_gender == "Other/would rather not say"),
+    phd = sum(Dem_edu == "PhD/Doctorate"),
+    college = sum(Dem_edu == "College degree, bachelor, master"),
+    some_college = sum(Dem_edu == "Some College, short continuing education or equivalent"),
+    school_12 = sum(Dem_edu == "Up to 12 years of school"),
+    school_9 = sum(Dem_edu == "Up to 9 years of school"),
+    school_6 = sum(Dem_edu == "Up to 6 years of school"),
+    none = sum(Dem_edu == "None")
+  )
+```
+
+The code below gives the gender percentages and the three education percentages reported in the Methods section.
+
+```{r}
+# The percentages of each gender and of three education categories are calculated for the full sample, rounded to one decimal.
+data %>%
+  summarise(
+    female = round(100 * sum(Dem_gender == "Female") / n(), 1),
+    male = round(100 * sum(Dem_gender == "Male") / n(), 1),
+    other = round(100 * sum(Dem_gender == "Other/would rather not say") / n(), 1),
+    college = round(100 * sum(Dem_edu == "College degree, bachelor, master") / n(), 1),
+    some_college = round(100 * sum(Dem_edu == "Some College, short continuing education or equivalent") / n(), 1),
+    phd = round(100 * sum(Dem_edu == "PhD/Doctorate") / n(), 1)
+  )
+```
+
+## General compliance
+
+The code below gives the mean and standard deviation of general compliance, which is the item Compliance_2 (Methods section).
+
+```{r}
+# The mean and standard deviation of general compliance are calculated, rounded to two decimals.
+data %>%
+  summarise(
+    mean = round(mean(Compliance_2), 2),
+    sd = round(sd(Compliance_2), 2)
+  )
+```
+
+## Response distribution
+
+The code below counts the participants at each response of general compliance and draws these counts as a bar plot (Supplementary Figure S1). The plot is saved as `figure_compliance_distribution.pdf`.
+
+```{r}
+# The number of participants at each response is printed.
+data %>%
+  count(Compliance_2)
+
+# The bar plot has one bar for each of the six responses.
+figure_compliance_distribution <- ggplot(
+  data,
+  aes(x = factor(Compliance_2, levels = 1:6))
+) +
+  # The bars are grey, and the number of participants is printed above each bar.
+  geom_bar(fill = "grey70") +
+  geom_text(
+    stat = "count",
+    aes(label = comma(after_stat(count))),
+    vjust = -0.5,
+    size = 3
+  ) +
+  # The y-axis runs from 0 to 30,000, with grid lines at 10,000, 20,000, and 30,000.
+  scale_y_continuous(
+    limits = c(0, 30000),
+    breaks = c(10000, 20000, 30000),
+    labels = label_comma()
+  ) +
+  # Both axes are named. The x-axis title explains the endpoints of the response scale.
+  labs(
+    x = "Response (1 = Strongly disagree, 6 = Strongly agree)",
+    y = "Number of participants"
+  ) +
+  # A minimal theme is used, and the vertical and minor grid lines are removed.
+  theme_minimal() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# The figure is shown in the R output.
+figure_compliance_distribution
+
+# The figure is saved as the PDF for Supplementary Figure S1, Distribution of Responses on General Compliance.
+ggsave(
+  "figure_compliance_distribution.pdf",
+  plot = figure_compliance_distribution,
+  width = 16,
+  height = 10,
+  units = "cm"
+)
+```
+ 

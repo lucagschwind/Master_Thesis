@@ -1,0 +1,134 @@
+---
+title: "GAMM partial effects for the aligned Big Five scores"
+output: html_document
+---
+ 
+# GAMM partial effects for the aligned Big Five scores
+
+This script gives the following figure: Figure 6, Partial Effects of the Aligned Big Five Scores in the Generalised Additive Mixed Model (Results section).
+
+```{r}
+# The packages for drawing and arranging the panels are loaded.
+library(gratia)
+library(ggplot2)
+library(patchwork)
+
+# The saved training-set model is loaded.
+# The script stops if the model does not contain the 49,207 training observations.
+fit <- readRDS("gamm_trait_model.rds")
+stopifnot(nobs(fit) == 49207)
+
+# Each smooth in the model is linked to its panel title. The order of this list sets the order of the panels.
+trait_names <- c(
+  "s(CON_z)" = "Conscientiousness",
+  "s(AGR_z)" = "Agreeableness",
+  "s(OPE_z)" = "Openness",
+  "s(EXT_z)" = "Extraversion",
+  "s(NEU_z)" = "Neuroticism"
+)
+```
+
+## Drawing the smooths
+
+```{r}
+# gratia draws the original smooth plot: one panel per trait, with the smooth, its confidence band, and a rug of the observed scores.
+panels <- draw(
+  fit,
+  select = names(trait_names),
+  caption = FALSE,
+  ci_col = "grey50",
+  ci_alpha = 0.35,
+  wrap = FALSE
+)
+# The panels are ordered as conscientiousness, agreeableness, openness, extraversion, and neuroticism.
+panels <- panels[names(trait_names)]
+```
+
+## Adjusting the panels
+
+```{r}
+# The original plot is then adjusted.
+# Every panel has a white background, dashed horizontal grid lines, and a centred title.
+panel_theme <- theme_bw(base_size = 11, base_family = "Arial") +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80", linetype = "dashed"),
+    plot.title = element_text(size = 11, hjust = 0.5),
+    plot.margin = margin(5, 8, 2, 4)
+  )
+
+# Every panel receives a line at zero, an x-axis from -4.5 to 4.5, a y-axis from -0.6 to 0.6, and the theme above.
+panel_format <- list(
+  geom_hline(yintercept = 0, linewidth = 0.6),
+  scale_x_continuous(breaks = seq(-4, 4, by = 2)),
+  scale_y_continuous(
+    breaks = seq(-0.6, 0.6, by = 0.2),
+    labels = c("-0.6", "-0.4", "-0.2", "0", "0.2", "0.4", "0.6")
+  ),
+  coord_cartesian(xlim = c(-4.5, 4.5), ylim = c(-0.6, 0.6)),
+  panel_theme
+)
+
+# The shared format is applied, and each panel receives its own title.
+# The panel has no x-axis title, because one title is placed below the figure.
+for (i in seq_along(panels)) {
+  panels[[i]] <- panels[[i]] +
+    panel_format +
+    labs(title = trait_names[[i]], x = NULL)
+}
+```
+
+## Arranging the panels on the page
+
+```{r}
+# The upper row contains conscientiousness, agreeableness, and openness.
+# The y-axis is shown once, on the left of this row.
+top_row <- panels[[1]] + panels[[2]] + panels[[3]] +
+  plot_layout(nrow = 1, axes = "collect_y", axis_titles = "collect_y")
+
+# This theme removes the y-axis. It is applied to neuroticism, so the lower row shows the y-axis only beside extraversion.
+hide_y <- theme(
+  axis.text.y = element_blank(),
+  axis.title.y = element_blank(),
+  axis.ticks.y = element_blank()
+)
+# Extraversion and neuroticism are centred between two empty spaces.
+# The widths give these panels the same width as the panels above.
+bottom_row <- plot_spacer() + panels[[4]] + (panels[[5]] + hide_y) + plot_spacer() +
+  plot_layout(
+    nrow = 1,
+    widths = c(0.343, 1, 1, 0.343),
+    axes = "collect_y",
+    axis_titles = "collect_y"
+  )
+
+# One x-axis title is placed below the figure.
+x_title <- wrap_elements(
+  full = grid::textGrob(
+    "Standardised aligned Big Five score",
+    gp = grid::gpar(fontsize = 11, fontfamily = "Arial", col = "black")
+  )
+)
+
+# The upper row, the lower row, and the x-axis title are combined.
+# The title occupies a narrow strip at the bottom of the page.
+figure_gamm_smooths <- top_row / bottom_row / x_title +
+  plot_layout(heights = c(1, 1, 0.045))
+figure_gamm_smooths
+```
+
+## Saving the figure
+
+```{r}
+# The figure is saved as the PDF for Figure 6, Partial Effects of the Aligned Big Five Scores in the Generalised Additive Mixed Model (Results section).
+dir.create("figures", showWarnings = FALSE)
+ggsave(
+  "figures/figure_gamm_smooths.pdf",
+  plot = figure_gamm_smooths,
+  width = 19.05,
+  height = 13.72,
+  units = "cm",
+  device = cairo_pdf
+)
+```

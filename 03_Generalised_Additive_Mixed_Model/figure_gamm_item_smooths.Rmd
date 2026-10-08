@@ -1,0 +1,211 @@
+---
+title: "GAMM partial effects for the BFI-S items"
+output: html_document
+---
+ 
+# GAMM partial effects for the BFI-S items
+
+This script gives the following figure: Supplementary Figure S2, Partial Effects of the BFI-S Items in the Generalised Additive Mixed Model, including its continued page.
+
+```{r}
+# The packages for drawing and arranging the panels are loaded.
+library(gratia)
+library(ggplot2)
+library(patchwork)
+
+# The saved training-set model is loaded.
+# The script stops if the model does not contain the 49,207 training observations.
+fit <- readRDS("gamm_item_model.rds")
+stopifnot(nobs(fit) == 49207)
+
+# This table gives the code, the wording, and the trait of each item. Its order sets the order of the panels.
+items <- tibble::tribble(
+  ~code, ~wording, ~trait,
+  "BFF_15_1", "Worries a lot", "Neuroticism",
+  "BFF_15_2", "Gets nervous easily", "Neuroticism",
+  "BFF_15_3", "Remains calm in tense situations (reversed)", "Neuroticism",
+  "BFF_15_4", "Is talkative", "Extraversion",
+  "BFF_15_5", "Is outgoing, sociable", "Extraversion",
+  "BFF_15_6", "Is reserved (reversed)", "Extraversion",
+  "BFF_15_7", "Is original, comes up with new ideas", "Openness",
+  "BFF_15_8", "Values artistic, aesthetic experiences", "Openness",
+  "BFF_15_9", "Has an active imagination", "Openness",
+  "BFF_15_10", "Is sometimes rude to others (reversed)", "Agreeableness",
+  "BFF_15_11", "Has a forgiving nature", "Agreeableness",
+  "BFF_15_12", "Is considerate and kind to almost everyone", "Agreeableness",
+  "BFF_15_13", "Does a thorough job", "Conscientiousness",
+  "BFF_15_14", "Tends to be lazy (reversed)", "Conscientiousness",
+  "BFF_15_15", "Does things efficiently", "Conscientiousness"
+)
+# The name of each item smooth in the model is added to the table.
+items$smooth <- paste0("s(", items$code, "_z)")
+```
+
+## Drawing the smooths
+
+```{r}
+# This function wraps an item wording onto two lines of at most 28 characters.
+# A short wording receives a blank second line, so every subtitle has the same height.
+# The script stops if a wording needs more than two lines.
+two_lines <- function(text, width = 28) {
+  lines <- strwrap(text, width = width)
+  stopifnot(length(lines) <= 2)
+  if (length(lines) == 1) lines <- c(lines, " ")
+  paste(lines, collapse = "\n")
+}
+
+# gratia draws the original smooth plot: one panel per item, with the smooth, its confidence band, and a rug of the observed responses.
+panels <- draw(
+  fit,
+  select = items$smooth,
+  caption = FALSE,
+  ci_col = "grey50",
+  ci_alpha = 0.35,
+  wrap = FALSE
+)
+# The panels follow the order of the item table.
+panels <- panels[items$smooth]
+```
+
+## Adjusting the panels
+
+```{r}
+# The original plot is then adjusted.
+# Every panel has a white background, dashed horizontal grid lines, a centred title, and a smaller centred subtitle.
+panel_theme <- theme_bw(base_size = 8, base_family = "Arial") +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(colour = "grey80", linetype = "dashed"),
+    axis.text = element_text(size = 7.5),
+    plot.title = element_text(
+      size = 8, hjust = 0.5,
+      margin = margin(0, 0, 0, 0)
+    ),
+    plot.subtitle = element_text(
+      size = 6.5, hjust = 0.5,
+      lineheight = 0.85, margin = margin(0, 0, 0, 0)
+    ),
+    plot.margin = margin(0, 7, 0, 7)
+  )
+
+# Every panel receives a line at zero, an x-axis from -4.5 to 4.5, a y-axis from -0.6 to 0.6, and the theme above.
+panel_format <- list(
+  geom_hline(yintercept = 0),
+  scale_x_continuous(breaks = seq(-4, 4, by = 2)),
+  scale_y_continuous(
+    breaks = seq(-0.6, 0.6, by = 0.2),
+    labels = c("-0.6", "-0.4", "-0.2", "0", "0.2", "0.4", "0.6")
+  ),
+  coord_cartesian(xlim = c(-4.5, 4.5), ylim = c(-0.6, 0.6)),
+  panel_theme
+)
+
+# The shared format is applied, and each panel receives its item code and wording.
+# The panels have no axis titles, because those titles are placed beside the page.
+for (i in seq_along(panels)) {
+  panels[[i]] <- panels[[i]] +
+    panel_format +
+    labs(
+      title = items$code[[i]],
+      subtitle = two_lines(items$wording[[i]]),
+      x = NULL,
+      y = NULL
+    )
+
+  # The y-axis numbers are shown only in the left column of each page.
+  if (!(i %in% seq(1, 15, by = 3))) {
+    panels[[i]] <- panels[[i]] +
+      theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  }
+  # The x-axis numbers are shown only on the bottom row of each page.
+  if (!(i %in% c(7:9, 13:15))) {
+    panels[[i]] <- panels[[i]] +
+      theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+  }
+}
+```
+
+## Arranging the panels on the pages
+
+```{r}
+# This function turns a text into a figure element, optionally rotated. It is used for the axis titles and the trait labels.
+figure_label <- function(text, rotation = 0) {
+  wrap_elements(
+    full = grid::textGrob(
+      text,
+      rot = rotation,
+      gp = grid::gpar(fontsize = 8, fontfamily = "Arial", col = "black")
+    )
+  )
+}
+
+# This function builds one page from a shared y-axis title, one row of three panels per trait, and a shared x-axis title.
+# In the page design, each letter is one part: A is the y-axis title, each following group is a trait label and its three panels,
+# and the last letter is the x-axis title. # is an empty cell.
+one_page <- function(traits) {
+  page_parts <- list(figure_label("Partial effect", rotation = 90))
+  for (trait in traits) {
+    page_parts <- c(
+      page_parts,
+      list(figure_label(trait, rotation = 90)),
+      panels[items$trait == trait]
+    )
+  }
+  page_parts <- c(page_parts, list(figure_label("Standardised BFI-S item")))
+  if (length(traits) == 3) {
+    layout <- "ABCDE\nAFGHI\nAJKLM\n##NNN"
+    heights <- c(1, 1, 1, 0.045)
+  } else if (length(traits) == 2) {
+    layout <- "ABCDE\nAFGHI\n##JJJ"
+    heights <- c(1, 1, 0.07)
+  } else {
+    stop("A page contains either two or three traits.")
+  }
+  # The first two columns hold the labels, and the last three hold the item panels.
+  wrap_plots(
+    page_parts,
+    design = layout,
+    widths = c(0.1, 0.1, 1, 1, 1),
+    heights = heights
+  )
+}
+
+# The first page of Supplementary Figure S2 contains neuroticism, extraversion, and openness.
+# The continued page contains agreeableness and conscientiousness.
+pages <- list(
+  one_page(c("Neuroticism", "Extraversion", "Openness")),
+  one_page(c("Agreeableness", "Conscientiousness"))
+)
+
+# The first page has three trait rows and the continued page has two.
+# A fixed part of the height is kept on both pages, and the remaining height is divided across the trait rows.
+# Each trait row then has the same height on both pages.
+first_page_height <- 19.94
+fixed_height <- 0.86
+page_heights <- c(
+  first_page_height,
+  2 * (first_page_height - fixed_height) / 3 + fixed_height
+)
+```
+
+## Saving the figure
+
+```{r}
+# The first page is saved as the first PDF for Supplementary Figure S2, and the second page as its continued page.
+dir.create("figures", showWarnings = FALSE)
+page_files <- c(
+  "figures/figure_gamm_item_smooths_1.pdf",
+  "figures/figure_gamm_item_smooths_2.pdf"
+)
+for (page_number in seq_along(pages)) {
+  ggsave(
+    page_files[[page_number]],
+    plot = pages[[page_number]],
+    width = 19.05,
+    height = page_heights[[page_number]],
+    units = "cm",
+    device = cairo_pdf
+  )
+}
+```
