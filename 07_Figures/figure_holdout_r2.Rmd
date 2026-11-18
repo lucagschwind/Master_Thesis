@@ -22,7 +22,7 @@ holdout_r2 <- tibble(
     levels = c("LMM", "GAMM", "RF", "XGB", "NN")
   ),
   trait_score = c(0.161, 0.164, 0.165, 0.169, 0.167),
-  item_level = c(0.175, 0.179, 0.177, 0.187, 0.184)
+  item_level = c(0.175, 0.179, 0.177, 0.187, 0.182)
 )
 
 # Each value becomes one row, so each point in the figure has its own row.
